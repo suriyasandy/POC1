@@ -1,0 +1,67 @@
+import pandas as pd
+import numpy as np
+
+def simulate_trades(
+    df: pd.DataFrame,
+    n_trades_per_day: int = 50,
+    vol_col: str = 'Volatility',
+    price_col: str = 'Close',
+    seed: int = 42
+) -> pd.DataFrame:
+    """
+    Simulate deal rates around MarketRate with noise ∼ N(0,vol/10).
+    """
+    np.random.seed(seed)
+    rows = []
+    for _, row in df.iterrows():
+        date = row['Date']
+        mkt  = row[price_col]
+        vol  = row[vol_col]
+        noises = np.random.normal(0, vol/10, n_trades_per_day)
+        deals  = mkt * (1 + noises)
+        devs   = (deals - mkt) / mkt
+        rows.append(pd.DataFrame({
+            'Date': date,
+            'MarketRate': mkt,
+            'DealRate': deals,
+            'Deviation': devs
+        }))
+    return pd.concat(rows, ignore_index=True)
+
+def apply_trade_flags(
+    trades: pd.DataFrame,
+    df_stat: pd.DataFrame,
+    df_ml: pd.DataFrame,
+    evt_threshold: float
+) -> pd.DataFrame:
+    """
+    Tag each trade with Rolling, EVT, IF, SVM, AE flags.
+    """
+    stat_idx = df_stat.set_index('Date')['Threshold_High']
+    ml_idx   = df_ml.set_index('Date')[['IF_Anomaly','SVM_Anomaly','AE_Anomaly']]
+
+    t = trades.copy()
+    t['Threshold_High'] = t['Date'].map(stat_idx)
+    t['Rolling_Flag']   = (t['Deviation'].abs() > t['Threshold_High']).astype(int)
+    t['EVT_Flag']       = (t['Deviation'].abs() > evt_threshold).astype(int)
+    t[['IF_Flag','SVM_Flag','AE_Flag']] = t['Date'].map(ml_idx).tolist()
+    return t
+
+def aggregate_backtest_metrics(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per-day flag rates and avg |Deviation| for flagged vs. OK.
+    """
+    def summarize(grp, flag):
+        return pd.Series({
+            f'{flag}_Rate': grp[flag].mean(),
+            f'{flag}_AvgDev_Flag': grp.loc[grp[flag]==1,'Deviation'].abs().mean(),
+            f'{flag}_AvgDev_OK': grp.loc[grp[flag]==0,'Deviation'].abs().mean()
+        })
+
+    metrics = []
+    for date, grp in trades.groupby('Date'):
+        m = {'Date': date}
+        for f in ['Rolling_Flag','EVT_Flag','IF_Flag','SVM_Flag','AE_Flag']:
+            m.update(summarize(grp, f).to_dict())
+        metrics.append(m)
+    return pd.DataFrame(metrics).set_index('Date')
