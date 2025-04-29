@@ -1,0 +1,14 @@
+import pandas as pd
+
+def compute_consensus(
+    flags: pd.DataFrame,
+    threshold: float = 0.5
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Fraction of models flagging each row → consensus breach.
+    Business note: reduces reliance on any single method,
+    improving robustness and stakeholder confidence.
+    """
+    consensus_score  = flags.mean(axis=1)
+    consensus_breach = (consensus_score >= threshold).astype(int)
+    return consensus_score, consensus_breach
