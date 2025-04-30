@@ -1,0 +1,56 @@
+import pandas as pd
+import numpy as np
+
+def validate_annualization(df: pd.DataFrame, vol_col: str = 'OHLCVolatility') -> pd.DataFrame:
+    """
+    Ensure Volatility is annualized; if not, scale by sqrt(252).
+    """
+    df = df.copy()
+    if df[vol_col].max() < 0.5:
+        df[vol_col] *= np.sqrt(252)
+    return df
+
+def compute_log_returns(df: pd.DataFrame, price_col: str = 'Close') -> pd.DataFrame:
+    """
+    Compute daily log returns.
+    """
+    df = df.copy()
+    df['LogReturn'] = np.log(df[price_col] / df[price_col].shift(1))
+    return df.dropna()
+
+def build_synthetic_cross(
+    df_all: pd.DataFrame,
+    base: str,
+    quote: str,
+    cross_name: str = 'INRJPY'
+) -> pd.DataFrame:
+    """
+    Build synthetic cross X/Y (e.g. INR/JPY) from USDX and USDY series in df_all.
+    Assumes df_all has columns [Date,Close,OHLCVolatility,Currency].
+    - base, quote: currency codes (e.g. 'INR','JPY')
+    - synthetic rate = USDQUOTE / USDBASE
+    - synthetic vol (annual) = sqrt(vol_BASE^2 + vol_QUOTE^2)
+    """
+    df_base  = df_all[df_all['Currency']==base][['Date','Close','OHLCVolatility']].rename(
+        columns={'Close':f'Close_{base}','OHLCVolatility':f'Vol_{base}'})
+    df_quote = df_all[df_all['Currency']==quote][['Date','Close','OHLCVolatility']].rename(
+        columns={'Close':f'Close_{quote}','OHLCVolatility':f'Vol_{quote}'})
+
+    df = pd.merge(df_base, df_quote, on='Date')
+    # Synthetic price: USDQUOTE / USDBASE gives quote per base
+    df['Close'] = df[f'Close_{quote}'] / df[f'Close_{base}']
+    # Synthetic annual vol: sqrt(vol_base^2 + vol_quote^2)
+    df['Volatility'] = np.sqrt(df[f'Vol_{base}']**2 + df[f'Vol_{quote}']**2)
+    # LogReturn of synthetic
+    df['LogReturn'] = np.log(df['Close'] / df['Close'].shift(1))
+    return df[['Date','Close','Volatility','LogReturn']].dropna()
+
+def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pipeline for consolidated file rows:
+      1) validate annualization
+      2) compute LogReturn
+    """
+    df = validate_annualization(df, vol_col='OHLCVolatility')
+    df = compute_log_returns(df, price_col='Close')
+    return df
