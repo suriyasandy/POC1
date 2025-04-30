@@ -1,0 +1,108 @@
+# … assume tabs = st.tabs([...,"🚀 Shock Simulation"]) above …
+
+with tabs[5]:
+    st.header("🚀 Shock Simulation & Recalibration")
+
+    # 1) User picks shock‐window start/end
+    first_bd = dfc.index.min().date() + datetime.timedelta(days=1)
+    last_bd  = min(dfc.index.max().date(), datetime.date.today())
+
+    shock_start = st.date_input(
+        "Shock Start Date",
+        value=first_bd,
+        min_value=first_bd,
+        max_value=last_bd
+    )
+    shock_end = st.date_input(
+        "Shock End Date",
+        value=last_bd,
+        min_value=shock_start,
+        max_value=last_bd
+    )
+
+    # 2) Shock magnitude factor
+    shock_factor = st.slider(
+        "Shock Magnitude (× real vol)",
+        min_value=1.0, max_value=5.0, value=2.0, step=0.1
+    )
+
+    # 3) Define snapshot = day before shock_start
+    snapshot_ts = (pd.Timestamp(shock_start) - BDay(1)).date()
+    st.markdown(f"**Snapshot Date** (pre‐shock): **{snapshot_ts}**")
+
+    # 4) Build two histories:
+    #    A) up through snapshot — for manual threshold
+    hist_snap = df[df.Date <= pd.to_datetime(snapshot_ts)]
+    mv_snap, bt_snap = compute_manual_groups(hist_snap)
+    mb1,mb2 = mv_snap.set_index('Currency')['Band'][[base_cc,quote_cc]]
+    man_band = mb1 if order.index(mb1)>order.index(mb2) else mb2
+    man_thr_snap = bt_snap.set_index('Band')['BandThreshold'][man_band]
+
+    #    B) up through shock_end, but with synthetic shock injected
+    hist_full = dfc.copy()
+    # inject shock only into the cross‐vol series
+    shocked_vol = hist_full['Vol'].copy()
+    mask = (hist_full.index.date >= shock_start) & \
+           (hist_full.index.date <= shock_end)
+    shocked_vol.loc[mask] *= shock_factor
+
+    # create a fresh DataFrame for calibration on shocked data
+    calib_vol = shocked_vol.loc[:pd.to_datetime(shock_end)]
+    calib_lr  = np.log(calib_vol / calib_vol.shift(1)).dropna().values
+
+    cp = calibrate_regime(
+        calib_vol, calib_lr,
+        target_rate, roll_windows, roll_qs, evt_tails
+    )
+
+    dyn_alert = calib_vol.rolling(cp['window'])\
+                         .quantile(cp['quantile']).iat[-1]
+    dyn_evt   = evt_vol_threshold(calib_vol, 0.90, cp['tail'])
+
+    # 5) KPI cards
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Manual Thr (at snap)", f"{man_thr_snap:.4f}")
+    col2.metric("Dynamic Alert Thr",    f"{dyn_alert:.4f}")
+    col3.metric("Dynamic EVT Thr",      f"{dyn_evt:.4f}")
+
+    # 6) Time‐series with shaded synthetic shock
+    vs = shocked_vol.loc[
+        pd.to_datetime(shock_start) - BDay(5):
+        pd.to_datetime(shock_end) + BDay(0)
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=vs.index, y=vs.values,
+        name="Shocked Volatility", line=dict(color='blue')
+    ))
+    fig.add_vrect(
+        x0=pd.to_datetime(shock_start),
+        x1=pd.to_datetime(shock_end),
+        fillcolor="LightSalmon", opacity=0.3, layer="below"
+    )
+    fig.add_hline(
+        y=man_thr_snap, line_dash='dash', line_color='black',
+        annotation_text="Manual Thr", annotation_position="bottom left"
+    )
+    fig.add_hline(
+        y=dyn_alert, line_dash='dot', line_color='orange',
+        annotation_text="Dyn Alert", annotation_position="bottom center"
+    )
+    fig.add_hline(
+        y=dyn_evt, line_dash='longdash', line_color='red',
+        annotation_text="Dyn EVT", annotation_position="bottom right"
+    )
+    fig.update_layout(
+        title="Synthetic Shock & Threshold Recalibration",
+        xaxis_title="Date", yaxis_title="Daily Volatility",
+        height=450
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("""
+    - **Shaded region** shows your synthetic shock window (vol × factor).  
+    - **Manual Thr** remains fixed at snapshot.  
+    - **Dynamic Alert** & **Dynamic EVT** recompute *on the shocked data* up through `shock_end`.  
+    - This lets you stress‐test exactly how your hybrid thresholds adapt to sudden vol spikes.
+    """)
