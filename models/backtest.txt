@@ -1,0 +1,38 @@
+def apply_trade_flags(
+    trades: pd.DataFrame,
+    df_stat: pd.DataFrame,
+    df_ml: pd.DataFrame,
+    evt_threshold: float,
+    manual_threshold: float = None
+) -> pd.DataFrame:
+    """
+    Tag each trade with Rolling, EVT, IF, SVM, AE, and Manual flags.
+    """
+    # 1) Start with a copy of trades
+    t = trades.copy()
+
+    # 2) Merge in the rolling threshold
+    stat_idx = df_stat.set_index('Date')['Threshold_High']
+    t['ThreshStat'] = t['Date'].map(stat_idx)
+    t['Rolling_Flag'] = (t['Deviation'].abs() > t['ThreshStat']).astype(int)
+
+    # 3) EVT flag
+    t['EVT_Flag'] = (t['Deviation'].abs() > evt_threshold).astype(int)
+
+    # 4) Merge in ML flags by Date
+    #    df_ml must have Date, IF_Anomaly, SVM_Anomaly, AE_Anomaly
+    ml_flags = df_ml.set_index('Date')[['IF_Anomaly','SVM_Anomaly','AE_Anomaly']]
+    t = t.merge(ml_flags, left_on='Date', right_index=True, how='left')
+
+    # 5) Rename ML columns to your flag names
+    t = t.rename(columns={
+        'IF_Anomaly': 'IF_Flag',
+        'SVM_Anomaly': 'SVM_Flag',
+        'AE_Anomaly': 'AE_Flag'
+    })
+
+    # 6) Manual flag (if provided)
+    if manual_threshold is not None:
+        t['Manual_Flag'] = (t['Deviation'].abs() > manual_threshold).astype(int)
+
+    return t
