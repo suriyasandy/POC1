@@ -1,0 +1,30 @@
+from scipy.stats import genpareto
+
+def evt_vol_threshold(vol: pd.Series, 
+                      u_pct: float = 0.90, 
+                      tail_pct: float = 0.995) -> float:
+    """
+    Fit a GPD to the upper tail of vol (above the u_pct quantile)
+    and return the vol threshold exceeded with probability (1-tail_pct).
+    """
+    # 1) preliminary threshold
+    u = np.quantile(vol, u_pct)
+    exceed = vol[vol > u] - u
+    if len(exceed) < 1:
+        return u  # nothing to fit, just return the cutoff
+
+    # 2) fit GPD
+    c, loc, scale = genpareto.fit(exceed, floc=0)
+
+    # 3) fraction of observations in exceedance
+    p_exc = (1 - tail_pct) / (1 - u_pct)
+
+    # 4) find the corresponding exceedance quantile and re-add u
+    var = genpareto.ppf(1 - p_exc, c, loc=0, scale=scale)
+    return u + var
+
+dyn_evt = evt_vol_threshold(
+    hist['Vol'],
+    u_pct=0.90,        # you can tune this preliminary cutoff
+    tail_pct=cp['tail']  # the same tail probability you calibrated
+)
