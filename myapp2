@@ -1,0 +1,166 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import itertools
+import plotly.graph_objects as go
+import plotly.express as px
+
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+
+# ────────────────────────────────────────────────────────────────────────────────
+# UTILITY FUNCTIONS
+# ────────────────────────────────────────────────────────────────────────────────
+
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':       (0.00, 0.07),
+    'Medium':    (0.07, 0.50),
+    'High':      (0.50, 0.60),
+    'VeryHigh':  (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mean_vol = (
+        df2.groupby('Currency')['DailyVol']
+           .mean()
+           .reset_index(name='MeanDailyVol')
+    )
+    def assign_band(v):
+        for b,(lo,hi) in MANUAL_BANDS.items():
+            if hi is None and v>=lo: return b
+            if lo<=v<hi:            return b
+        return None
+    mean_vol['Band'] = mean_vol['MeanDailyVol'].map(assign_band)
+    band_thr = (
+        mean_vol.groupby('Band')['MeanDailyVol']
+                .max()
+                .reset_index(name='BandThreshold')
+    )
+    return mean_vol, band_thr
+
+def detect_regimes(series, n_states):
+    arr = series.values.reshape(-1,1)
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200)
+    model.fit(arr)
+    states = model.predict(arr)
+    # compute mean vol per state to find "high" state
+    means = {s: arr[states==s].mean() for s in np.unique(states)}
+    high  = max(means, key=means.get)
+    return states, high, means[high]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# APP START
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="FX Threshold PoC", layout="wide")
+st.title("Regime‐Shift Visualization for Individual Currencies & Crosses")
+
+# Sidebar: load data
+st.sidebar.header("Upload FX Data")
+f = st.sidebar.file_uploader("CSV with columns: Date,Currency,OHLCVolatility,Close", type="csv")
+if not f:
+    st.sidebar.info("Please upload your FX data.")
+    st.stop()
+
+# Read & preprocess
+df = (pd.read_csv(f, parse_dates=['Date'])
+        .sort_values(['Currency','Date']))
+df['DailyVol'] = df['OHLCVolatility'] / np.sqrt(252)
+
+# Sidebar: select parameters
+currencies = sorted(df['Currency'].unique())
+st.sidebar.header("Select Pair & Regime Settings")
+base  = st.sidebar.selectbox("Base Currency", currencies, index=currencies.index('EUR') if 'EUR' in currencies else 0)
+quote = st.sidebar.selectbox("Quote Currency", [c for c in currencies if c!=base], index=0)
+n_states = st.sidebar.slider("HMM States", 2, 4, 2)
+
+# Extract series
+base_ser  = df[df.Currency==base].set_index('Date')['DailyVol']
+quote_ser = df[df.Currency==quote].set_index('Date')['DailyVol']
+
+# Detect regimes per currency
+states_b, high_b, thr_b = detect_regimes(base_ser,  n_states)
+states_q, high_q, thr_q = detect_regimes(quote_ser, n_states)
+
+# Build cross volatility
+cross_vol = np.sqrt(base_ser**2 + quote_ser**2)
+cross_lr  = np.log((df[df.Currency==quote].set_index('Date')['Close'] /
+                    df[df.Currency==base].set_index('Date')['Close']).loc[cross_vol.index]).dropna()
+states_x, high_x, thr_x = detect_regimes(cross_vol.loc[cross_lr.index], n_states)
+
+# Pack into DataFrames
+df_base  = pd.DataFrame({'Date':base_ser.index,  'Vol':base_ser.values,  'Regime':states_b})
+df_quote = pd.DataFrame({'Date':quote_ser.index,'Vol':quote_ser.values,'Regime':states_q})
+df_cross = pd.DataFrame({'Date':cross_vol.index,'Vol':cross_vol.values,'Regime':states_x})
+
+df_base['RegLabel']  = df_base.Regime.map(lambda s: f"State {s}")
+df_quote['RegLabel'] = df_quote.Regime.map(lambda s: f"State {s}")
+df_cross['RegLabel'] = df_cross.Regime.map(lambda s: f"State {s}")
+
+# Find regime change dates
+chg_b = df_base.loc[df_base.Regime.ne(df_base.Regime.shift()), 'Date']
+chg_q = df_quote.loc[df_quote.Regime.ne(df_quote.Regime.shift()), 'Date']
+chg_x = df_cross.loc[df_cross.Regime.ne(df_cross.Regime.shift()), 'Date']
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Plotting
+# ────────────────────────────────────────────────────────────────────────────────
+
+tab1, tab2, tab3 = st.tabs(["📈 Base Currency","📈 Quote Currency","📈 Cross"])
+
+with tab1:
+    st.subheader(f"{base} Regime Shifts")
+    fig = px.line(df_base, x='Date', y='Vol', color='RegLabel',
+                  title=f"{base} Daily Volatility by Regime")
+    for d in chg_b:
+        fig.add_vline(x=d, line_dash='dash', line_color='red')
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    st.subheader(f"{quote} Regime Shifts")
+    fig = px.line(df_quote, x='Date', y='Vol', color='RegLabel',
+                  title=f"{quote} Daily Volatility by Regime")
+    for d in chg_q:
+        fig.add_vline(x=d, line_dash='dash', line_color='green')
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab3:
+    st.subheader(f"{base}/{quote} Cross Regime Shifts")
+    fig = px.line(df_cross, x='Date', y='Vol', color='RegLabel',
+                  title=f"{base}/{quote} Cross Daily Vol by Regime")
+    # annotate cross regime changes
+    for d in chg_x:
+        fig.add_vline(x=d, line_dash='dash', line_color='black')
+    # annotate base & quote changes
+    for d in chg_b:
+        fig.add_vline(x=d, line_dash='dot', line_color='red', opacity=0.3)
+    for d in chg_q:
+        fig.add_vline(x=d, line_dash='dot', line_color='green', opacity=0.3)
+    # add legend entries manually
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None],
+        mode='lines', line=dict(color='red',   dash='dot'),
+        name=f"{base} Regime Change"
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None],
+        mode='lines', line=dict(color='green', dash='dot'),
+        name=f"{quote} Regime Change"
+    ))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("""
+    **Legend**  
+    - **Solid colors**: cross regime states  
+    - **Black dashed**: cross‐level regime changes  
+    - **Red dotted**: base‐currency regime changes  
+    - **Green dotted**: quote‐currency regime changes
+    """)
+
+# End of app
