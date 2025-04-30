@@ -1,0 +1,354 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import itertools
+import plotly.graph_objects as go
+import plotly.express as px
+
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 1) UTILITY FUNCTIONS
+# ────────────────────────────────────────────────────────────────────────────────
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':       (0.00, 0.07),
+    'Medium':    (0.07, 0.50),
+    'High':      (0.50, 0.60),
+    'Very High': (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mean_vol = (
+        df2.groupby('Currency')['DailyVol']
+           .mean()
+           .reset_index(name='MeanDailyVol')
+    )
+    def assign_band(v):
+        for band,(low,high) in MANUAL_BANDS.items():
+            if high is None:
+                if v >= low: return band
+            elif low <= v < high:
+                return band
+        return None
+    mean_vol['Band'] = mean_vol['MeanDailyVol'].map(assign_band)
+    band_thr = (
+        mean_vol.groupby('Band')['MeanDailyVol']
+                .max()
+                .reset_index(name='BandThreshold')
+    )
+    return mean_vol, band_thr
+
+def build_crosses(df):
+    piv_c = df.pivot(index='Date', columns='Currency', values='Close')
+    piv_v = df.pivot(index='Date', columns='Currency', values='OHLCVolatility')
+    crosses=[]
+    codes = sorted(df['Currency'].unique())
+    for i, base in enumerate(codes):
+        for quote in codes[i+1:]:
+            rate = piv_c[quote]/piv_c[base]
+            vol  = np.sqrt(piv_v[base]**2 + piv_v[quote]**2)
+            lr   = np.log(rate/rate.shift(1))
+            tmp = pd.DataFrame({
+                'Date': rate.index,
+                'Cross': f"{base}/{quote}",
+                'Close': rate.values,
+                'Volatility': vol.values,
+                'LogReturn': lr.values
+            }).dropna()
+            crosses.append(tmp)
+    return pd.concat(crosses, ignore_index=True)
+
+def rolling_quantile_thr(vol, window, q=0.95):
+    return vol.rolling(window).quantile(q)
+
+def garch_evt_thr(returns, tail_pct=0.995):
+    am  = arch_model(returns*100, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+    std = (res.resid / res.conditional_volatility)
+    std = std[~np.isnan(std)]
+    u = np.quantile(std, 0.90)
+    exceed = std[std>u] - u
+    c, loc, scale = genpareto.fit(exceed, floc=0)
+    p_exc = (tail_pct - (1 - np.mean(std>u))) / np.mean(std>u)
+    var_exc = genpareto.ppf(p_exc, c, loc=0, scale=scale)
+    return (u + var_exc)/100.0
+
+def compute_hmm( vol_series, n_states):
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=100)
+    arr = vol_series.reshape(-1,1)
+    model.fit(arr)
+    states = model.predict(arr)
+    means = {s: arr[states==s].mean() for s in np.unique(states)}
+    high_state = max(means, key=means.get)
+    thr = means[high_state]
+    return states, high_state, thr
+
+def recommend_ml_params(X, manual_rate):
+    # IsolationForest contamination
+    grid_if  = [0.01, 0.03, 0.05, 0.1]
+    best_if  = min(grid_if, key=lambda c: abs(
+        (IsolationForest(contamination=c,random_state=1)
+            .fit_predict(X)==-1).mean() - manual_rate))
+    # OneClassSVM nu
+    grid_svm = [0.01, 0.03, 0.05, 0.1]
+    best_svm = min(grid_svm, key=lambda nu: abs(
+        (OneClassSVM(nu=nu).fit_predict(X)==-1).mean() - manual_rate))
+    # Autoencoder tail
+    grid_ae  = [0.90, 0.95, 0.99]
+    scaler = StandardScaler(); Xs = scaler.fit_transform(X)
+    n_feats = Xs.shape[1]
+    # build once AE model
+    ae = Sequential([
+        Dense(n_feats*2, activation='relu', input_shape=(n_feats,)),
+        Dense(n_feats//2, activation='relu'),
+        Dense(n_feats*2, activation='relu'),
+        Dense(n_feats,    activation='linear')
+    ])
+    ae.compile(Adam(1e-3), loss='mse')
+    ae.fit(Xs, Xs, epochs=30, batch_size=32, verbose=0)
+    recon = ae.predict(Xs)
+    mse   = np.mean((Xs-recon)**2, axis=1)
+    best_ae = min(grid_ae, key=lambda t: abs(
+        (mse > np.quantile(mse,t)).mean() - manual_rate))
+    return best_if, best_svm, best_ae
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 2) STREAMLIT UI
+# ────────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="FX Threshold PoC", layout="wide")
+st.title("FX Volatility Thresholding — Manual vs. Dynamic & HMM")
+
+# Sidebar
+st.sidebar.header("Upload & Settings")
+f = st.sidebar.file_uploader(
+    "Upload CSV (Date,Open,High,Low,Close,OHLCVolatility,Currency)",
+    type="csv"
+)
+if not f:
+    st.sidebar.info("Please upload data.")
+    st.stop()
+
+df_all = pd.read_csv(f, parse_dates=['Date']).sort_values('Date')
+
+# 1) Manual groups & thresholds
+mean_vol_df, band_thr_df = compute_manual_groups(df_all)
+
+# 2) Build crosses
+cross_df = build_crosses(df_all)
+cross_list = sorted(cross_df['Cross'].unique())
+sel_cross = st.sidebar.selectbox("Select Cross", cross_list)
+
+# 3) Dynamic params
+st.sidebar.header("Dynamic Thresholds")
+rq_w   = st.sidebar.slider("Rolling Window",30,120,60)
+evt_p  = st.sidebar.slider("EVT Tail %ile",0.990,0.999,0.995,0.001)
+
+# 4) HMM params
+st.sidebar.header("HMM Regime")
+n_states = st.sidebar.slider("HMM States",2,4,2)
+
+# 5) Consensus
+cons_t = st.sidebar.slider("Consensus Fraction",0.1,1.0,0.5,0.05)
+
+# — Filter selected cross —
+dfc = cross_df.query("Cross==@sel_cross").reset_index(drop=True)
+
+# — Manual threshold for cross —
+base,quote = sel_cross.split('/')
+b1 = mean_vol_df.loc[mean_vol_df.Currency==base,'Band'].iat[0]
+b2 = mean_vol_df.loc[mean_vol_df.Currency==quote,'Band'].iat[0]
+order=['Low','Medium','High','Very High']
+man_band = b1 if order.index(b1)>order.index(b2) else b2
+man_thr  = band_thr_df.loc[band_thr_df.Band==man_band,'BandThreshold'].iat[0]
+
+# — Dynamic thresholds —
+dfc['Roll95'] = rolling_quantile_thr(dfc['Volatility'], rq_w, q=0.95)
+evt_thr       = garch_evt_thr(dfc['LogReturn'].values, tail_pct=evt_p)
+
+# — Breach flags —
+dfc['Breach_Manual']   = (dfc['Volatility']>man_thr).astype(int)
+dfc['Breach_Roll95']   = (dfc['Volatility']>dfc['Roll95']).astype(int)
+dfc['Breach_EVT']      = (dfc['Volatility']>evt_thr).astype(int)
+dfc['Breach_Cons']     = ((dfc[['Breach_Roll95','Breach_EVT']].mean(axis=1)>=cons_t)
+                          .astype(int))
+
+# — HMM regime & breach —
+states, high_state, hmm_thr = compute_hmm(dfc['Volatility'].values, n_states)
+dfc['HMM_State']     = states
+dfc['Breach_HMM']    = (states==high_state).astype(int)
+
+# — Aggregate rates —
+rates = dfc.set_index('Date')[
+    ['Breach_Manual','Breach_Roll95','Breach_EVT','Breach_Cons','Breach_HMM']
+].rename(columns={
+    'Breach_Manual':'Manual',
+    'Breach_Roll95':'Rolling 95%',
+    'Breach_EVT':'EVT',
+    'Breach_Cons':'Consensus',
+    'Breach_HMM':'HMM'
+})
+
+# — Recommend ML hyperparams —
+X = dfc[['Volatility','LogReturn']].values
+manual_rate = rates['Manual'].mean()
+best_if, best_svm, best_ae = recommend_ml_params(X, manual_rate)
+
+# — Per-currency thresholds table —
+# Rolling-95 and EVT for each currency vs USD
+roll_list=[]
+evt_list=[]
+for curr in df_all['Currency'].unique():
+    sub = df_all[df_all.Currency==curr].sort_values('Date')
+    r95 = sub['OHLCVolatility'].rolling(rq_w).quantile(0.95).iat[-1]
+    roll_list.append({'Currency':curr,'Roll95':r95})
+    lr = np.log(sub['Close']/sub['Close'].shift(1)).dropna().values
+    e  = garch_evt_thr(lr, tail_pct=evt_p)
+    evt_list.append({'Currency':curr,'EVT':e})
+roll_df = pd.DataFrame(roll_list)
+evt_df  = pd.DataFrame(evt_list)
+currency_thresholds = (
+    mean_vol_df[['Currency','Band']]
+    .merge(band_thr_df.rename(columns={'BandThreshold':'Manual'}), on='Band')
+    .merge(roll_df, on='Currency')
+    .merge(evt_df, on='Currency')
+    .set_index('Currency')
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 3) TABS: Overview, Results, Calibration
+# ────────────────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["📝 Overview","📊 Results & Visuals","⚙️ Calibration"])
+
+with tab1:
+    st.header("How Thresholding Works")
+    st.markdown("""
+    **Manual Bands**: mean daily vol buckets → static thresholds.  
+    **Rolling-95%**: adaptive quantile.  
+    **EVT**: GARCH(1,1) + GPD tail-risk.  
+    **Consensus**: majority of {Rolling, EVT}.  
+    **HMM**: hidden‐Markov regimes (calm vs storm).  
+    **Hyperparam Tuning**: auto-recommend IF, SVM, AE to match manual breach rate.
+    """)
+
+with tab2:
+    st.header(f"Results for {sel_cross}")
+
+    # Per-currency threshold table
+    st.subheader("Per-Currency Thresholds")
+    st.dataframe(currency_thresholds.style.format({
+        'Manual':"{:.4f}", 'Roll95':"{:.4f}", 'EVT':"{:.4f}"
+    }))
+
+    # Manual bands bar
+    st.subheader("Manual Bands Distribution")
+    fig0 = px.bar(mean_vol_df, x='Currency', y='MeanDailyVol',
+                  color='Band', labels={'MeanDailyVol':'Mean Daily Vol'})
+    st.plotly_chart(fig0, use_container_width=True)
+
+    st.markdown(f"**This cross’s manual band**: **{man_band}**, Thr={man_thr:.4f}")
+
+    # KPI cards
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1.metric("Manual Thr", f"{man_thr:.4f}")
+    c2.metric("Rolling 95% Thr", f"{dfc['Roll95'].iat[-1]:.4f}")
+    c3.metric("EVT Thr", f"{evt_thr:.4f}")
+    c4.metric("Consensus Frac", f"{cons_t:.2f}")
+    c5.metric("HMM Thr", f"{hmm_thr:.4f}")
+    c6.metric("IF cont rec.", f"{best_if:.3f}")
+
+    st.markdown(f"Recommended SVM ν={best_svm:.3f}, AE tail={best_ae:.2f}")
+
+    st.markdown("---")
+
+    # Overlay thresholds
+    st.subheader("Volatility & Threshold Overlays")
+    opts = ["Manual","Rolling 95%","EVT","Consensus","HMM"]
+    sel = st.multiselect("Overlay:", opts, default=opts[:3])
+
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(x=dfc.Date, y=dfc.Volatility, name='Volatility'))
+    style = {
+        "Manual":      dict(y=[man_thr]*len(dfc),       line=dict(dash='dash')),
+        "Rolling 95%": dict(y=dfc.Roll95,               line=dict(dash='dot')),
+        "EVT":         dict(y=[evt_thr]*len(dfc),       line=dict(dash='longdash')),
+        "Consensus":   dict(y=[cons_t]*len(dfc),        line=dict(dash='dashdot')),
+        "HMM":         dict(y=[hmm_thr]*len(dfc),       line=dict(dash='solid'))
+    }
+    for key in sel:
+        fig1.add_trace(go.Scatter(
+            x=dfc.Date, y=style[key]['y'],
+            name=key, line=style[key]['line']
+        ))
+    fig1.update_layout(xaxis=dict(rangeslider=dict(visible=True)),height=450)
+    st.plotly_chart(fig1, use_container_width=True)
+
+    st.markdown("---")
+
+    # Daily breach rates
+    st.subheader("Daily Breach Rates")
+    fig2 = go.Figure()
+    for col in rates.columns:
+        fig2.add_trace(go.Scatter(x=rates.index, y=rates[col], name=col))
+    fig2.update_layout(xaxis=dict(rangeslider=dict(visible=True)),height=350)
+    st.plotly_chart(fig2, use_container_width=True)
+
+    summary = rates.mean().rename("Avg Breach Rate").to_frame()
+    st.table(summary.style.format("{:.1%}"))
+
+with tab3:
+    st.header("Calibration: Rolling & EVT")
+    st.markdown("Sweep window & tail to see breach‐rate heatmaps.")
+
+    windows = [30,60,90,120]
+    evts    = [0.990,0.995,0.999]
+    calib=[]
+    for w,e in itertools.product(windows,evts):
+        r95 = rolling_quantile_thr(dfc.Volatility, w, q=0.95)
+        br_r = (dfc.Volatility>r95).mean()
+        br_e = (dfc.Volatility>garch_evt_thr(dfc.LogReturn.values,e)).mean()
+        br_c = (((dfc.Volatility>r95).astype(int)+
+                 (dfc.Volatility>garch_evt_thr(dfc.LogReturn.values,e)).astype(int))/2
+                >= cons_t).mean()
+        calib.append({'Window':w,'EVT Pct':e,
+                      'Rolling 95%':br_r,'EVT':br_e,'Consensus':br_c})
+    cd = pd.DataFrame(calib)
+
+    st.markdown("##### Rolling‐Only Breach Rate")
+    rp = cd.pivot(index='Window',columns='EVT Pct',values='Rolling 95%')
+    fig_r = px.imshow(rp, labels=dict(x="EVT %",y="Window",color="Breach Rate"),
+                     text_auto=".1%")
+    st.plotly_chart(fig_r, use_container_width=True)
+
+    st.markdown("##### EVT‐Only Breach Rate")
+    ep = cd.pivot(index='Window',columns='EVT Pct',values='EVT')
+    fig_e = px.imshow(ep, labels=dict(x="EVT %",y="Window",color="Breach Rate"),
+                     text_auto=".1%")
+    st.plotly_chart(fig_e, use_container_width=True)
+
+    st.markdown("##### At Your Selected Params")
+    selrow = cd[(cd.Window==rq_w)&(cd['EVT Pct']==evt_p)].iloc[0]
+    cmpdf = pd.DataFrame({
+        'Method':['Manual','Rolling 95%','EVT','Consensus'],
+        'Rate':[rates['Manual'].mean(),
+                selrow['Rolling 95%'],
+                selrow['EVT'],
+                selrow['Consensus']]
+    })
+    fig_c = px.bar(cmpdf, x='Method', y='Rate',
+                   text=cmpdf['Rate'].map("{:.1%}".format),
+                   labels={'Rate':'Avg Breach Rate'})
+    fig_c.update_layout(yaxis_tickformat=".0%",height=350)
+    st.plotly_chart(fig_c, use_container_width=True)
