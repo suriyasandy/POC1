@@ -1,0 +1,25 @@
+def smooth_regimes(raw_states: np.ndarray, min_run: int = 5) -> np.ndarray:
+    """
+    Collapse any contiguous run shorter than `min_run` days into its neighbors.
+    But if the series itself is shorter than `min_run`, just return it unchanged.
+    """
+    # 1) If too short, skip smoothing entirely
+    if len(raw_states) < min_run:
+        return raw_states.astype(int)
+
+    # 2) Otherwise proceed with run‐length smoothing
+    s = pd.Series(raw_states.copy())
+    runs    = (s != s.shift()).cumsum()
+    lengths = s.groupby(runs).transform('size')
+
+    # Mask out the short runs
+    s[lengths < min_run] = np.nan
+
+    # Forward‐ and backward‐fill so that only genuine multi‐day blocks remain
+    filled = s.ffill().bfill()
+
+    # There should be no NaNs now—but in case there are, fall back to raw
+    if filled.isna().any():
+        return raw_states.astype(int)
+
+    return filled.astype(int).values
