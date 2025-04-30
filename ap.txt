@@ -1,0 +1,291 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import itertools
+import plotly.graph_objects as go
+import plotly.express as px
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+import shap
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 1) UTILITY & CALIBRATION FUNCTIONS
+# ────────────────────────────────────────────────────────────────────────────────
+
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':       (0.00, 0.07),
+    'Medium':    (0.07, 0.50),
+    'High':      (0.50, 0.60),
+    'VeryHigh':  (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mean_vol = df2.groupby('Currency')['DailyVol'] \
+                  .mean().reset_index(name='MeanDailyVol')
+    def assign_band(v):
+        for b,(lo,hi) in MANUAL_BANDS.items():
+            if hi is None and v>=lo: return b
+            if lo<=v<hi: return b
+        return None
+    mean_vol['Band'] = mean_vol['MeanDailyVol'].map(assign_band)
+    band_thr = (mean_vol.groupby('Band')['MeanDailyVol']
+                        .max().reset_index(name='BandThreshold'))
+    return mean_vol, band_thr
+
+def build_crosses(df):
+    piv_c = df.pivot(index='Date', columns='Currency', values='Close')
+    piv_v = df.pivot(index='Date', columns='Currency', values='OHLCVolatility')
+    all_x = []
+    codes = sorted(df['Currency'].unique())
+    for i,base in enumerate(codes):
+        for quote in codes[i+1:]:
+            rate = piv_c[quote]/piv_c[base]
+            vol  = np.sqrt(piv_v[base]**2 + piv_v[quote]**2)
+            lr   = np.log(rate/rate.shift(1))
+            tmp = pd.DataFrame({
+                'Date':rate.index,
+                'Cross':f"{base}/{quote}",
+                'Volatility':vol.values,
+                'LogReturn':lr.values
+            }).dropna()
+            all_x.append(tmp)
+    return pd.concat(all_x,ignore_index=True)
+
+def rolling_quantile(vol,win,q):
+    return vol.rolling(win).quantile(q)
+
+def garch_evt(returns,tail=0.995):
+    am = arch_model(returns*100,vol='Garch',p=1,q=1)
+    res=am.fit(disp='off')
+    std=(res.resid/res.conditional_volatility)
+    std=std[~np.isnan(std)]
+    u=np.quantile(std,0.90)
+    exc=std[std>u]-u
+    c,loc,scale=genpareto.fit(exc,floc=0)
+    p_exc=(tail-(1-np.mean(std>u)))/np.mean(std>u)
+    var=genpareto.ppf(p_exc,c,loc=0,scale=scale)
+    return (u+var)/100
+
+def detect_regimes(vol,states):
+    hmm=GaussianHMM(n_components=states,covariance_type='full',n_iter=200)
+    arr=vol.values.reshape(-1,1)
+    hmm.fit(arr)
+    s=hmm.predict(arr)
+    means={i:arr[s==i].mean() for i in np.unique(s)}
+    high= max(means,key=means.get)
+    return s,high,means[high]
+
+def calibrate_for_rate(vol,lr,target,windows,qs,tails):
+    """
+    Grid search per regime: find (win,q) for rolling and tail for EVT such that 
+    breach rate ~= target. Returns dict of best params.
+    """
+    bests={'roll':{},'evt':{}}
+    # Rolling
+    candidates=[]
+    for w,q in itertools.product(windows,qs):
+        rate=(vol>rolling_quantile(vol,w,q)).mean()
+        candidates.append((abs(rate-target),(w,q)))
+    _,(bw,bq)=min(candidates,key=lambda x:x[0])
+    bests['roll']={'window':bw,'quantile':bq}
+    # EVT
+    candidates=[]
+    for t in tails:
+        thr=garch_evt(lr.values,t)
+        rate=(vol>thr).mean()
+        candidates.append((abs(rate-target),t))
+    bt=min(candidates,key=lambda x:x[0])[1]
+    bests['evt']={'tail':bt}
+    return bests
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 2) STREAMLIT UI
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="FX Threshold PoC",layout="wide")
+st.title("Regime-Aware, Multi-Tier FX Volatility Thresholding")
+
+# — Sidebar —
+st.sidebar.header("1️⃣ Upload & Basic Settings")
+file=st.sidebar.file_uploader("Upload CSV (Date,Open,High,Low,Close,OHLCVolatility,Currency)")
+if not file:
+    st.info("Please upload your consolidated FX data.")
+    st.stop()
+df=pd.read_csv(file,parse_dates=['Date']).sort_values('Date')
+
+mean_vol,band_thr=compute_manual_groups(df)
+crosses=build_crosses(df)['Cross'].unique()
+sel=st.sidebar.selectbox("Select Cross",sorted(crosses))
+
+st.sidebar.header("2️⃣ Regime Detection")
+n_states=st.sidebar.slider("HMM States",2,4,2)
+
+st.sidebar.header("3️⃣ Target & Calibration")
+target_rate=st.sidebar.slider("Target Alert Rate",0.01,0.20,0.05,0.01)
+roll_windows=[30,60,90,120]
+roll_qs=[0.90,0.95,0.99]
+evt_tails=[0.990,0.995,0.999]
+
+st.sidebar.header("4️⃣ Multi-Tier Levels")
+tiers=st.sidebar.multiselect("Tiers to show",
+    ['Warning (90%)','Alert (95%)','Critical (EVT)'],default=['Alert (95%)'])
+
+st.sidebar.header("5️⃣ ML Ensemble Tuning")
+# (defaults to target_rate)
+# we'll auto‐recommend below
+
+# — Filter cross data —
+dfc=build_crosses(df).query("Cross==@sel").reset_index(drop=True)
+
+# — Regime detection —
+dfc['Regime'],high_reg,hmm_thr=detect_regimes(dfc['Volatility'],n_states)
+reg_labels={i:f"Regime {i}" for i in sorted(dfc['Regime'].unique())}
+reg_choice=st.sidebar.selectbox("Label Regimes As",
+    list(reg_labels.values()),format_func=lambda x:x)
+
+# — Show regimes on vol chart —
+dfc['RegimeLabel']=dfc['Regime'].map(reg_labels)
+
+# — Per-Regime Calibration of dynamic thresholds —
+calib_params={}
+for regime,group in dfc.groupby('Regime'):
+    vol=group['Volatility']
+    lr=group['LogReturn']
+    cp=calibrate_for_rate(vol,lr,target_rate,roll_windows,roll_qs,evt_tails)
+    calib_params[regime]=cp
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Tabs
+# ────────────────────────────────────────────────────────────────────────────────
+tab1,tab2,tab3=st.tabs(["📋 Overview","🔧 Regimes & Calibration","📊 Dashboard"])
+
+with tab1:
+    st.header("Why This Approach?")
+    st.markdown("""
+    1. **Define Target Alert Rate** – align with your false-alarm vs. missed-alarm costs.  
+    2. **Detect Regimes** via HMM – capture Calm/Normal/Stress conditions.  
+    3. **Calibrate** rolling‐quantile & EVT per regime to meet your target rate.  
+    4. **Multi-Tier Alerts**:  
+       - *Warning*: 90th percentile  
+       - *Alert*:   95th percentile  
+       - *Critical*: EVT tail‐risk threshold  
+    5. **Robust Baseline**: EWMA & MAD control limits (future extension).  
+    6. **ML Ensemble**: Isolation Forest, SVM, Autoencoder + SHAP explanations.
+
+    This delivers a **defensible**, **explainable**, and **cost-aligned** thresholding framework.
+    """)
+
+with tab2:
+    st.header("Regimes & Calibrated Parameters")
+
+    # Show HMM regime timeline
+    fig_r = px.scatter(dfc, x='Date', y='Volatility', color='RegimeLabel',
+                       title="Volatility Colored by HMM Regime")
+    st.plotly_chart(fig_r,use_container_width=True)
+
+    # Show per-regime calibration results
+    rows=[]
+    for r,cp in calib_params.items():
+        rows.append({
+            'Regime':reg_labels[r],
+            'RollWin':cp['roll']['window'],
+            'RollQ':cp['roll']['quantile'],
+            'EVT Tail':cp['evt']['tail']
+        })
+    cdf=pd.DataFrame(rows)
+    st.table(cdf)
+
+with tab3:
+    st.header(f"Dashboard — Cross: {sel}")
+
+    # Compute thresholds per row using regime‐specific params
+    dfc['Thr_Warning'] = dfc.apply(
+        lambda r: rolling_quantile(rfc:=dfc.loc[dfc.Regime==r.Regime,'Volatility'],
+                                  calib_params[r.Regime]['roll']['window'],
+                                  0.90).loc[r.name],
+        axis=1
+    )
+    dfc['Thr_Alert']   = dfc.apply(
+        lambda r: rolling_quantile(dfc.loc[dfc.Regime==r.Regime,'Volatility'],
+                                  calib_params[r.Regime]['roll']['window'],
+                                  calib_params[r.Regime]['roll']['quantile']).loc[r.name],
+        axis=1
+    )
+    dfc['Thr_Critical']= dfc['Regime'].map({r:garch_evt(
+        dfc.loc[dfc.Regime==r,'LogReturn'].values,
+        calib_params[r]['evt']['tail']
+    ) for r in calib_params})
+
+    # KPI cards: show for the latest date and its regime
+    latest = dfc.iloc[-1]
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Latest Vol", f"{latest.Volatility:.4f}")
+    c2.metric("Warning Thr", f"{latest.Thr_Warning:.4f}")
+    c3.metric("Alert Thr",   f"{latest.Thr_Alert:.4f}")
+    c4.metric("Critical Thr",f"{latest.Thr_Critical:.4f}")
+    c5.metric("Regime",      f"{reg_labels[latest.Regime]}")
+
+    st.markdown("---")
+    # Overlay multi-tier thresholds
+    fig_d=go.Figure()
+    fig_d.add_trace(go.Scatter(x=dfc.Date, y=dfc.Volatility, name='Volatility'))
+    palette={'Warning':'orange','Alert':'red','Critical':'black'}
+    if 'Warning (90%)' in tiers:
+        fig_d.add_trace(go.Scatter(
+            x=dfc.Date, y=dfc.Thr_Warning, name='Warning', line=dict(color=palette['Warning'],dash='dash')
+        ))
+    if 'Alert (95%)' in tiers:
+        fig_d.add_trace(go.Scatter(
+            x=dfc.Date, y=dfc.Thr_Alert, name='Alert', line=dict(color=palette['Alert'],dash='dot')
+        ))
+    if 'Critical (EVT)' in tiers:
+        fig_d.add_trace(go.Scatter(
+            x=dfc.Date, y=dfc.Thr_Critical, name='Critical', line=dict(color=palette['Critical'],dash='longdash')
+        ))
+    fig_d.update_layout(xaxis=dict(rangeslider=dict(visible=True)),height=450)
+    st.plotly_chart(fig_d,use_container_width=True)
+
+    st.markdown("---")
+    # Breach‐rate comparison
+    rates2=pd.DataFrame({
+        'Warning':(dfc.Volatility>dfc.Thr_Warning).mean(),
+        'Alert':  (dfc.Volatility>dfc.Thr_Alert).mean(),
+        'Critical':(dfc.Volatility>dfc.Thr_Critical).mean()
+    },index=['BreachRate']).T
+    st.bar_chart(rates2)
+
+    # ML Ensemble + SHAP
+    st.subheader("ML Ensemble & SHAP Explanations")
+    X = dfc[['Volatility','LogReturn']].values
+    # Train simplified ensemble
+    if_clf = IsolationForest(contamination=target_rate).fit(X)
+    svm_clf=OneClassSVM(nu=target_rate).fit(X)
+    # Autoencoder
+    scaler=StandardScaler(); Xs=scaler.fit_transform(X)
+    ae=Sequential([Dense(4,activation='relu',input_shape=(2,)),
+                   Dense(1,activation='relu'),
+                   Dense(4,activation='relu'),
+                   Dense(2,activation='linear')])
+    ae.compile(Adam(1e-3),'mse')
+    ae.fit(Xs,Xs,epochs=20,batch_size=32,verbose=0)
+    recon=ae.predict(Xs); mse=np.mean((Xs-recon)**2,axis=1)
+    # SHAP on IF
+    explainer = shap.Explainer(if_clf.predict, X)
+    shap_vals = explainer(X)
+    st.text("IsolationForest SHAP on last point:")
+    st.write(shap_vals[-1])
+
+    st.markdown("**Selected ML Hyperparams**: "
+                f"IF cont={target_rate:.2f}, SVM ν={target_rate:.2f}, AE tail auto")
