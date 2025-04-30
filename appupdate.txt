@@ -1,0 +1,93 @@
+# … everything above stays the same …
+
+with tab_dash:
+    st.subheader(f"Dashboard for {sel_cross}")
+
+    # --- KPI Cards ---
+    today_vol    = df_stat['Volatility'].iloc[-1]
+    today_roll   = df_stat['Threshold_High'].iloc[-1]
+    today_evt    = evt_thr
+    today_manual = manual_thr
+    breach_rate  = df_cons['Breach'].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Volatility", f"{today_vol:.3f}")
+    c2.metric("Rolling High Thr",   f"{today_roll:.3f}")
+    c3.metric("EVT Thr",            f"{today_evt:.3f}")
+    c4.metric("Manual Group Thr",   f"{today_manual:.3f}")
+    st.metric("Consensus Breach Rate", f"{breach_rate:.1%}")
+
+    # --- Threshold Comparison Filter ---
+    st.markdown("#### Compare Thresholds")
+    thr_options = ["Manual Group", "Rolling High", "EVT"]
+    selected_thrs = st.multiselect(
+        "Select thresholds to display on the chart",
+        thr_options,
+        default=thr_options
+    )
+
+    # Build the combined thresholds DataFrame
+    thr_df = pd.DataFrame({
+        "Date": df_stat['Date']
+    })
+    if "Rolling High" in selected_thrs:
+        thr_df["Rolling High"] = df_stat['Threshold_High'].values
+    if "EVT" in selected_thrs:
+        thr_df["EVT"] = [today_evt] * len(thr_df)
+    if "Manual Group" in selected_thrs:
+        thr_df["Manual Group"] = [today_manual] * len(thr_df)
+
+    # --- Volatility vs. Selected Thresholds ---
+    st.markdown("#### Volatility & Selected Thresholds")
+    fig2 = go.Figure()
+    # Always plot volatility
+    fig2.add_trace(go.Scatter(
+        x=df_cross['Date'], y=df_cross['Volatility'],
+        name='Volatility', line=dict(color='blue')
+    ))
+    # Plot only the selected thresholds
+    colors = {"Rolling High":"orange", "EVT":"green", "Manual Group":"black"}
+    line_styles = {"Rolling High":"dash","EVT":"dot","Manual Group":"longdash"}
+    for thr in selected_thrs:
+        fig2.add_trace(go.Scatter(
+            x=thr_df['Date'],
+            y=thr_df[thr],
+            name=thr,
+            line=dict(color=colors[thr], dash=line_styles[thr])
+        ))
+
+    fig2.update_layout(
+        xaxis=dict(rangeslider=dict(visible=True)),
+        yaxis_title="Volatility / Threshold",
+        height=500
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # --- Daily Flag Rates (remains unchanged) ---
+    st.markdown("#### Daily Flag Rates")
+    df_rates = metrics.rename(columns=lambda c: c.replace('_Rate',''))
+    default_models = ["Manual","Consensus"] if "Consensus" in df_rates.columns else ["Manual"]
+    choices = st.multiselect(
+        "Select models to display", df_rates.columns.tolist(), default=default_models
+    )
+    fig1 = go.Figure()
+    for m in choices:
+        fig1.add_trace(go.Scatter(
+            x=df_rates.index, y=df_rates[m],
+            name=m, mode='lines+markers'
+        ))
+    fig1.update_layout(
+        yaxis_title="Flag Rate",
+        xaxis=dict(rangeslider=dict(visible=True)),
+        height=400
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # --- Sample Flagged Trades (unchanged) ---
+    st.markdown("#### Sample Flagged Trades (Consensus Breach)")
+    sample = flagged.query("Consensus_Breach==1").sample(min(10,len(flagged)), random_state=1)
+    st.dataframe(sample[[
+        'Date','Deviation',
+        'Manual_Flag','Rolling_Flag','EVT_Flag',
+        'IF_Flag','SVM_Flag','AE_Flag','Consensus_Breach'
+    ]])
