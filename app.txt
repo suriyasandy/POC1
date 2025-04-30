@@ -1,0 +1,221 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.subplots as sp
+
+from features import build_feature_matrix, build_all_synthetic_crosses
+from models.statistical import (
+    compute_manual_thresholds,
+    get_manual_threshold_cross,
+    rolling_quantile_thresholds,
+    garch_evt_threshold
+)
+from models.ml import run_isolation_forest, run_one_class_svm, run_autoencoder
+from models.ensemble import compute_consensus
+from models.backtest import simulate_trades, apply_trade_flags, aggregate_backtest_metrics
+
+st.set_page_config(page_title="FX Vol PoC — Overview & Dashboard", layout="wide")
+
+# — Sidebar: Upload & Settings —
+st.sidebar.header("1) Upload Data")
+uploaded = st.sidebar.file_uploader(
+    "Upload consolidated CSV (Date,Open,High,Low,Close,OHLCVolatility,Currency)",
+    type="csv"
+)
+if not uploaded:
+    st.sidebar.warning("Waiting for data upload…")
+    st.stop()
+
+st.sidebar.header("2) Select Cross & Settings")
+df_all = pd.read_csv(uploaded, parse_dates=['Date'])
+df_all = build_feature_matrix(df_all)
+
+# Manual thresholds
+mean_vol_df, group_thr_df = compute_manual_thresholds(
+    df_all, currency_col='Currency', vol_col='OHLCVolatility'
+)
+# Build all crosses
+df_cross_all = build_all_synthetic_crosses(df_all)
+crosses = sorted(df_cross_all['CrossPair'].unique())
+sel_cross = st.sidebar.selectbox("Cross Pair", crosses)
+
+# Simulation & model parameters
+n_trades = st.sidebar.slider("Simulated Trades/day", 10, 200, 50)
+rq_w = st.sidebar.slider("Rolling Window (days)", 30, 120, 60)
+rq_l, rq_h = st.sidebar.slider("Rolling Quantiles (low,high)", 0.01, 0.10, (0.05,0.95))
+evt_p = st.sidebar.slider("EVT Tail %ile", 0.990, 0.999, 0.995, step=0.001)
+cont_if = st.sidebar.slider("IF Contamination", 0.01, 0.10, 0.05, 0.005)
+nu_svm  = st.sidebar.slider("SVM ν",            0.01, 0.10, 0.05, 0.005)
+ae_tail = st.sidebar.slider("AE Tail %ile",     0.90, 0.99, 0.95, 0.01)
+cons_t  = st.sidebar.slider("Consensus Threshold", 0.1, 1.0, 0.5, 0.05)
+
+# Compute manual threshold for the selected cross
+base, quote = sel_cross[:3], sel_cross[3:]
+manual_thr = get_manual_threshold_cross(mean_vol_df, group_thr_df, base, quote)
+
+# Filter synthetic cross data
+df_cross = df_cross_all.query("CrossPair==@sel_cross").reset_index(drop=True)
+
+# Precompute all flags & metrics
+# 1) Statistical
+df_stat = rolling_quantile_thresholds(
+    df_cross[['Date','Volatility']], window=rq_w, low_q=rq_l, high_q=rq_h
+)
+evt_thr = garch_evt_threshold(df_cross, tail_pct=evt_p)
+
+# 2) ML
+X = df_cross[['Volatility','LogReturn']].values
+df_ml = df_cross[['Date','Volatility']].copy()
+df_ml['IF_Anomaly']  = run_isolation_forest(X, contamination=cont_if)
+df_ml['SVM_Anomaly'] = run_one_class_svm(X, nu=nu_svm)
+ae_mse               = run_autoencoder(X)
+ae_thr               = np.quantile(ae_mse, ae_tail)
+df_ml['AE_Anomaly']  = (ae_mse > ae_thr).astype(int)
+
+# 3) Consensus (per day)
+df_cons = pd.DataFrame({
+    'Date': df_stat['Date'],
+    'Rolling': (df_stat['Volatility'] > df_stat['Threshold_High']).astype(int),
+    'IF':      df_ml['IF_Anomaly'],
+    'SVM':     df_ml['SVM_Anomaly'],
+    'AE':      df_ml['AE_Anomaly']
+})
+df_cons['Score'], df_cons['Breach'] = compute_consensus(
+    df_cons[['Rolling','IF','SVM','AE']], threshold=cons_t
+)
+
+# 4) Backtest flags & metrics
+trades       = simulate_trades(df_cross, n_trades_per_day=n_trades)
+flagged      = apply_trade_flags(
+    trades, df_stat, df_ml, evt_thr, manual_threshold=manual_thr
+)
+metrics      = aggregate_backtest_metrics(flagged)
+# Rename for display
+metrics = metrics.rename(columns=lambda c: c.replace('_Rate',''))
+
+# — Tabs — Overview & Dashboard —
+tab_overview, tab_dash = st.tabs(["📋 Overview", "📊 Dashboard"])
+
+with tab_overview:
+    st.header("How This PoC Works")
+    st.markdown("""
+    **1) Manual Thresholds**  
+    - Convert annualized OHLC vol → daily vol = `OHLCVolatility/√252`.  
+    - Compute mean daily vol per currency → assign it to `Low/Medium/High/Very High` band.  
+    - Group threshold = max(mean vol) per band (static cut-offs).  
+
+    **2) Synthetic Cross**  
+    - Build every USD-X pair by pivoting your consolidated file.  
+    - Cross `X/Y = USDY/USDX`, vol = `√(vol_X^2 + vol_Y^2)`, log-returns from synthetic closes.  
+
+    **3) Dynamic Statistical Thresholds**  
+    - **Rolling Quantiles**: 5th/95th percentiles over a sliding window.  
+    - **GARCH‐EVT**: model conditional vol + extreme-value tail risk.  
+
+    **4) ML Anomaly Models**  
+    - **Isolation Forest**, **One-Class SVM**, **Autoencoder** capture non-linear and boundary anomalies.  
+
+    **5) Consensus Voting**  
+    - Simple majority of the above signals to raise a final breach alert.  
+
+    **6) Backtesting**  
+    - Simulate deals (`DealRate = MarketRate*(1+noise)`) to compare **Manual** vs **Dynamic** flag rates.  
+    """)
+
+with tab_dash:
+    st.subheader(f"Dashboard for {sel_cross}")
+
+    # --- KPI Cards ---
+    today_vol   = df_stat['Volatility'].iloc[-1]
+    today_roll  = df_stat['Threshold_High'].iloc[-1]
+    today_evt   = evt_thr
+    today_manual= manual_thr
+    breach_rate = df_cons['Breach'].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Volatility", f"{today_vol:.3f}")
+    c2.metric("Rolling Upper Thr", f"{today_roll:.3f}")
+    c3.metric("EVT Thr",           f"{today_evt:.3f}")
+    c4.metric("Manual Thr",        f"{today_manual:.3f}")
+    st.metric("Consensus Breach Rate", f"{breach_rate:.1%}")
+
+    # --- Daily Flag Rates ---
+    st.markdown("#### Daily Flag Rates")
+    df_rates = metrics[['Manual_Flag','Rolling_Flag','EVT_Flag',
+                        'IF_Flag','SVM_Flag','AE_Flag']].rename(columns={
+                            'Manual_Flag':'Manual',
+                            'Rolling_Flag':'Rolling',
+                            'EVT_Flag':'EVT',
+                            'IF_Flag':'IF',
+                            'SVM_Flag':'SVM',
+                            'AE_Flag':'AE'
+                        })
+    choices = st.multiselect(
+        "Select models to display",
+        df_rates.columns.tolist(),
+        default=['Manual','Consensus'] if 'Consensus' in df_rates else ['Manual']
+    )
+    # add consensus if desired
+    if 'Consensus' in choices:
+        df_rates['Consensus'] = df_cons.set_index('Date')['Breach'].reindex(df_rates.index).values
+
+    fig1 = go.Figure()
+    for m in choices:
+        if m in df_rates:
+            fig1.add_trace(go.Scatter(
+                x=df_rates.index, y=df_rates[m],
+                name=m, mode='lines+markers'
+            ))
+    fig1.update_layout(
+        yaxis_title="Flag Rate",
+        xaxis=dict(rangeslider=dict(visible=True)),
+        height=400
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # --- Volatility vs. Thresholds ---
+    st.markdown("#### Volatility & Thresholds")
+    fig2 = sp.make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.6,0.4],
+        vertical_spacing=0.08
+    )
+    # Volatility
+    fig2.add_trace(go.Scatter(
+        x=df_cross['Date'], y=df_cross['Volatility'],
+        name='Volatility', line=dict(color='blue')
+    ), row=1, col=1)
+    # Thresholds
+    fig2.add_trace(go.Scatter(
+        x=df_stat['Date'], y=df_stat['Threshold_High'],
+        name='Rolling High', line=dict(dash='dash',color='orange')
+    ), row=2, col=1)
+    fig2.add_trace(go.Scatter(
+        x=df_cross['Date'], y=[evt_thr]*len(df_cross),
+        name='EVT Thr', line=dict(dash='dot',color='green')
+    ), row=2, col=1)
+    fig2.add_trace(go.Scatter(
+        x=df_cross['Date'], y=[manual_thr]*len(df_cross),
+        name='Manual Thr', line=dict(dash='longdash',color='black')
+    ), row=2, col=1)
+
+    fig2.update_layout(
+        height=600,
+        xaxis2=dict(rangeslider=dict(visible=True)),
+        yaxis1_title="Volatility",
+        yaxis2_title="Thresholds"
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # --- Sample Flagged Trades ---
+    st.markdown("#### Sample Flagged Trades (Consensus Breach)")
+    sample = flagged.query("Consensus_Breach==1").sample(min(10,len(flagged)), random_state=1)
+    st.dataframe(sample[[
+        'Date','Deviation',
+        'Manual_Flag','Rolling_Flag','EVT_Flag',
+        'IF_Flag','SVM_Flag','AE_Flag','Consensus_Breach'
+    ]])
