@@ -1,0 +1,6 @@
+import pandas as pd
+
+def compute_consensus(flags: pd.DataFrame, threshold: float = 0.5):
+    score  = flags.mean(axis=1)
+    breach = (score >= threshold).astype(int)
+    return score, breach
