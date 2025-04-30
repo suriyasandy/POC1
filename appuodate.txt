@@ -1,0 +1,50 @@
+# … earlier code remains the same …
+
+with tab_dash:
+    st.subheader(f"Dashboard for {sel_cross}")
+
+    # KPI cards (unchanged) …
+    # …
+
+    # --- Prepare and rename the metrics DataFrame for flag‐rates ---
+    # metrics originally has columns like 'Manual_Flag_Rate','Rolling_Flag_Rate', etc.
+    df_rates = metrics.rename(columns={
+        'Manual_Flag_Rate': 'Manual',
+        'Rolling_Flag_Rate':'Rolling',
+        'EVT_Flag_Rate':    'EVT',
+        'IF_Flag_Rate':     'IF',
+        'SVM_Flag_Rate':    'SVM',
+        'AE_Flag_Rate':     'AE',
+        'ConsensusBreach_Rate': 'Consensus'
+    })
+
+    # Make sure every column is one of our known labels:
+    # ['Manual','Rolling','EVT','IF','SVM','AE','Consensus']
+    options = df_rates.columns.tolist()
+
+    # --- Daily Flag Rates with correct defaults ---
+    st.markdown("#### Daily Flag Rates")
+    default_selection = []
+    if 'Manual' in options:    default_selection.append('Manual')
+    if 'Consensus' in options: default_selection.append('Consensus')
+
+    choices = st.multiselect(
+        "Select models to display",
+        options=options,
+        default=default_selection
+    )
+
+    fig1 = go.Figure()
+    for m in choices:
+        fig1.add_trace(go.Scatter(
+            x=df_rates.index, y=df_rates[m],
+            name=m, mode='lines+markers'
+        ))
+    fig1.update_layout(
+        yaxis_title="Flag Rate",
+        xaxis=dict(rangeslider=dict(visible=True)),
+        height=400
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # … rest of your dashboard (thresholds, sample trades) …
