@@ -1,0 +1,217 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import itertools
+import plotly.graph_objects as go
+import plotly.express as px
+
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+
+# ────────────────────────────────────────────────────────────────────────────────
+# UTILITY FUNCTIONS
+# ────────────────────────────────────────────────────────────────────────────────
+
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':       (0.00, 0.07),
+    'Medium':    (0.07, 0.50),
+    'High':      (0.50, 0.60),
+    'VeryHigh':  (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mean_vol = (
+        df2.groupby('Currency')['DailyVol']
+           .mean()
+           .reset_index(name='MeanDailyVol')
+    )
+    def assign_band(v):
+        for b,(lo,hi) in MANUAL_BANDS.items():
+            if hi is None and v>=lo: return b
+            if lo<=v<hi:            return b
+        return None
+    mean_vol['Band'] = mean_vol['MeanDailyVol'].map(assign_band)
+    band_thr = (
+        mean_vol.groupby('Band')['MeanDailyVol']
+                .max()
+                .reset_index(name='BandThreshold')
+    )
+    return mean_vol, band_thr
+
+def rolling_quantile(vol, window, q):
+    return vol.rolling(window).quantile(q)
+
+def garch_evt(returns, tail_pct):
+    am  = arch_model(returns*100, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+    std = (res.resid / res.conditional_volatility)
+    std = std[~np.isnan(std)]
+    u   = np.quantile(std, 0.90)
+    exc = std[std>u] - u
+    c,loc,scale = genpareto.fit(exc, floc=0)
+    p_exc = (tail_pct - (1 - np.mean(std>u))) / np.mean(std>u)
+    var   = genpareto.ppf(p_exc, c, loc=0, scale=scale)
+    return (u + var)/100.0
+
+def detect_regimes(vol, n_states):
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200)
+    arr   = vol.values.reshape(-1,1)
+    model.fit(arr)
+    states = model.predict(arr)
+    means  = {s: arr[states==s].mean() for s in np.unique(states)}
+    high   = max(means, key=means.get)
+    return states, high, means[high]
+
+def calibrate_regime(vol, lr, target, windows, qs, tails):
+    # rolling
+    best_wq = min(
+        ((abs((vol > rolling_quantile(vol,w,q)).mean() - target), (w,q))
+         for w,q in itertools.product(windows,qs)),
+        key=lambda x: x[0]
+    )[1]
+    # EVT
+    best_t = min(
+        ((abs((vol > garch_evt(lr,t)).mean() - target), t)
+         for t in tails),
+        key=lambda x: x[0]
+    )[1]
+    return {'window':best_wq[0], 'quantile':best_wq[1], 'tail':best_t}
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# STREAMLIT APP
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="FX Threshold PoC", layout="wide")
+st.title("Regime & Multi-Tier FX Volatility Thresholding")
+
+# ─ Sidebar ─────────────────────────────────────────────────────────────────────
+st.sidebar.header("1️⃣ Upload & Settings")
+f = st.sidebar.file_uploader(
+    "Upload CSV (Date,Open,High,Low,Close,OHLCVolatility,Currency)",
+    type="csv"
+)
+if not f:
+    st.sidebar.info("Awaiting FX data…")
+    st.stop()
+
+df = pd.read_csv(f, parse_dates=['Date']).sort_values(['Currency','Date'])
+df['DailyVol'] = df['OHLCVolatility'] / SQRT252
+
+# Manual grouping (not used in regime plots, but for Dashboard later)
+mean_vol_df, band_thr_df = compute_manual_groups(df)
+
+# Sidebar selections
+currencies = sorted(df['Currency'].unique())
+base       = st.sidebar.selectbox("2️⃣ Base Currency", currencies, index=0)
+quote      = st.sidebar.selectbox("3️⃣ Quote Currency", [c for c in currencies if c!=base], index=0)
+n_states   = st.sidebar.slider("4️⃣ HMM States", 2, 4, 2)
+
+# For later Dashboard
+st.sidebar.header("5️⃣ Calibration")
+target_rate  = st.sidebar.slider("Target Alert Rate", 0.01,0.20,0.05,0.01)
+roll_windows = [30,60,90,120]
+roll_qs      = [0.90,0.95,0.99]
+evt_tails    = [0.990,0.995,0.999]
+
+st.sidebar.header("6️⃣ Multi-Tier & Consensus")
+tiers    = st.sidebar.multiselect("Show Tiers", ['Warning (90%)','Alert (95%)','Critical (EVT)'], default=['Alert (95%)'])
+cons_frac= st.sidebar.slider("Consensus Fraction", 0.1,1.0,0.5,0.05)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 1) Per-Currency Regimes
+# ────────────────────────────────────────────────────────────────────────────────
+# Base
+base_df = df[df.Currency==base].set_index('Date')
+states_b, high_b, thr_b = detect_regimes(base_df['DailyVol'], n_states)
+base_df = base_df.assign(Regime=states_b, RegLabel=[f"Regime {s}" for s in states_b])
+
+# Quote
+quote_df = df[df.Currency==quote].set_index('Date')
+states_q, high_q, thr_q = detect_regimes(quote_df['DailyVol'], n_states)
+quote_df = quote_df.assign(Regime=states_q, RegLabel=[f"Regime {s}" for s in states_q])
+
+# Cross
+# align on dates present in both series
+common_idx = base_df.index.intersection(quote_df.index)
+cross_vol  = np.sqrt(base_df.loc[common_idx,'DailyVol']**2 + quote_df.loc[common_idx,'DailyVol']**2)
+cross_lr   = np.log(
+    df[df.Currency==quote].set_index('Date')['Close'].loc[common_idx] /
+    df[df.Currency==base].set_index('Date')['Close'].loc[common_idx]
+)
+states_x, high_x, thr_x = detect_regimes(cross_vol.loc[cross_lr.index], n_states)
+cross_df = pd.DataFrame({
+    'Date':       cross_vol.loc[cross_lr.index].index,
+    'Volatility': cross_vol.loc[cross_lr.index].values,
+    'Regime':     states_x
+}).set_index('Date')
+cross_df['RegLabel'] = cross_df['Regime'].map(lambda s:f"Regime {s}")
+
+# find regime-change dates
+chg_b = base_df.Regime.ne(base_df.Regime.shift())
+chg_q = quote_df.Regime.ne(quote_df.Regime.shift())
+chg_x = cross_df.Regime.ne(cross_df.Regime.shift())
+
+# ────────────────────────────────────────────────────────────────────────────────
+# TABS: Currency & Cross Regime Shifts
+# ────────────────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs([
+    f"📈 {base} Regimes",
+    f"📈 {quote} Regimes",
+    f"📈 {base}/{quote} Regimes"
+])
+
+with tab1:
+    st.subheader(f"{base} Daily Volatility Regime Shifts")
+    fig_b = px.line(base_df, x=base_df.index, y='DailyVol', color='RegLabel',
+                    labels={'DailyVol':'Daily Vol'}, title=f"{base} Regime Shifts")
+    for d in base_df.index[chg_b]:
+        fig_b.add_vline(x=d, line_dash='dash', line_color='red', opacity=0.6)
+    st.plotly_chart(fig_b, use_container_width=True)
+
+with tab2:
+    st.subheader(f"{quote} Daily Volatility Regime Shifts")
+    fig_q = px.line(quote_df, x=quote_df.index, y='DailyVol', color='RegLabel',
+                    labels={'DailyVol':'Daily Vol'}, title=f"{quote} Regime Shifts")
+    for d in quote_df.index[chg_q]:
+        fig_q.add_vline(x=d, line_dash='dash', line_color='green', opacity=0.6)
+    st.plotly_chart(fig_q, use_container_width=True)
+
+with tab3:
+    st.subheader(f"{base}/{quote} Cross Daily Volatility Regime Shifts")
+    fig_x = px.line(cross_df, x=cross_df.index, y='Volatility', color='RegLabel',
+                    labels={'Volatility':'Daily Vol'}, title=f"{base}/{quote} Cross Regime Shifts")
+    # cross changes
+    for d in cross_df.index[chg_x]:
+        fig_x.add_vline(x=d, line_dash='dash', line_color='black', opacity=0.6)
+    # overlay base & quote change lines
+    for d in base_df.index[chg_b & base_df.index.isin(cross_df.index)]:
+        fig_x.add_vline(x=d, line_dash='dot', line_color='red', opacity=0.4)
+    for d in quote_df.index[chg_q & quote_df.index.isin(cross_df.index)]:
+        fig_x.add_vline(x=d, line_dash='dot', line_color='green', opacity=0.4)
+    # legend entries
+    fig_x.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(color='red', dash='dot'),
+        name=f"{base} Regime Change"
+    ))
+    fig_x.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(color='green', dash='dot'),
+        name=f"{quote} Regime Change"
+    ))
+    st.plotly_chart(fig_x, use_container_width=True)
+
+    st.markdown("""
+    **Legend**  
+    - **Colored lines**: regime‐coloured volatility.  
+    - **Black dashed**: cross‐level regime change.  
+    - **Red dotted**: base currency regime change.  
+    - **Green dotted**: quote currency regime change.
+    """)
