@@ -1,0 +1,52 @@
+import pandas as pd
+import numpy as np
+
+def validate_annualization(df: pd.DataFrame, vol_col: str = 'OHLCVolatility') -> pd.DataFrame:
+    df = df.copy()
+    if df[vol_col].max() < 0.5:
+        df[vol_col] *= np.sqrt(252)
+    return df
+
+def compute_log_returns(df: pd.DataFrame, price_col: str = 'Close') -> pd.DataFrame:
+    df = df.copy()
+    df['LogReturn'] = np.log(df[price_col] / df[price_col].shift(1))
+    return df.dropna()
+
+def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    df = validate_annualization(df, vol_col='OHLCVolatility')
+    return compute_log_returns(df, price_col='Close')
+
+def build_all_synthetic_crosses(
+    df_all: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    For every pair of non-USD currencies in df_all, build synthetic X/Y:
+      - Close_XY = Close_USD—Y / Close_USD—X
+      - Volatility_XY = sqrt(vol_X^2 + vol_Y^2)
+      - LogReturn_XY
+    Returns a long DataFrame with:
+      ['Date','CrossPair','Close','Volatility','LogReturn']
+    """
+    df_all = df_all.copy()
+    df_all = validate_annualization(df_all, 'OHLCVolatility')
+    df_all = compute_log_returns(df_all, 'Close')
+    # pivot USD-X series
+    piv_close = df_all.pivot(index='Date', columns='Currency', values='Close')
+    piv_vol   = df_all.pivot(index='Date', columns='Currency', values='OHLCVolatility')
+    crosses = []
+    codes = sorted(df_all['Currency'].unique())
+    for i, base in enumerate(codes):
+        for quote in codes[i+1:]:
+            # synthetic rate = USDquote / USDbase
+            close_xy = piv_close[quote] / piv_close[base]
+            vol_xy   = np.sqrt(piv_vol[base]**2 + piv_vol[quote]**2)
+            logret_xy = np.log(close_xy / close_xy.shift(1))
+            df_xy = pd.DataFrame({
+                'Date': close_xy.index,
+                'CrossPair': f"{base}{quote}",
+                'Close': close_xy.values,
+                'Volatility': vol_xy.values,
+                'LogReturn': logret_xy.values
+            }).dropna()
+            crosses.append(df_xy)
+    return pd.concat(crosses, ignore_index=True)
