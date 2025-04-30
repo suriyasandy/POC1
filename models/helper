@@ -1,0 +1,11 @@
+def smooth_regimes(raw_states: np.ndarray, min_run: int = 5) -> np.ndarray:
+    """
+    Collapse any regime‐run shorter than min_run days into its neighboring regime.
+    """
+    s = pd.Series(raw_states)
+    # label each contiguous run
+    runs   = (s != s.shift()).cumsum()
+    lengths= s.groupby(runs).transform('size')
+    # mark short runs as NaN, then ffill/bfill into neighbors
+    s[lengths < min_run] = np.nan
+    return s.ffill().bfill().astype(int).values
