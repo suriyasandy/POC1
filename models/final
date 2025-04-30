@@ -1,0 +1,296 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import itertools
+import plotly.graph_objects as go
+import plotly.express as px
+
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+
+# ────────────────────────────────────────────────────────────────────────────────
+# UTILITY FUNCTIONS
+# ────────────────────────────────────────────────────────────────────────────────
+
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':      (0.00, 0.07),
+    'Medium':   (0.07, 0.50),
+    'High':     (0.50, 0.60),
+    'VeryHigh': (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mean_vol = (df2.groupby('Currency')['DailyVol']
+                  .mean().reset_index(name='MeanDailyVol'))
+    def assign_band(v):
+        for b,(lo,hi) in MANUAL_BANDS.items():
+            if hi is None and v>=lo: return b
+            if lo<=v<hi:            return b
+        return None
+    mean_vol['Band'] = mean_vol['MeanDailyVol'].map(assign_band)
+    band_thr = (mean_vol.groupby('Band')['MeanDailyVol']
+                      .max().reset_index(name='BandThreshold'))
+    return mean_vol, band_thr
+
+def rolling_quantile(vol, window, q):
+    return vol.rolling(window).quantile(q)
+
+def garch_evt(returns, tail_pct):
+    am  = arch_model(returns*100, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+    std = res.resid / res.conditional_volatility
+    std = std[np.isfinite(std)]
+    u   = np.quantile(std, 0.90)
+    exc = std[std>u] - u
+    c,loc,scale = genpareto.fit(exc, floc=0)
+    p_exc = (tail_pct - (1 - np.mean(std>u))) / np.mean(std>u)
+    var   = genpareto.ppf(p_exc, c, loc=0, scale=scale)
+    return (u + var)/100.0
+
+def detect_regimes(vol, n_states):
+    clean = vol.replace([np.inf,-np.inf], np.nan).dropna()
+    if clean.empty:
+        # fallback: everyone state 0
+        return np.zeros(len(vol),int), 0, np.nan
+    arr = clean.values.reshape(-1,1)
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200)
+    model.fit(arr)
+    raw = model.predict(arr)
+    means = {s: arr[raw==s].mean() for s in np.unique(raw)}
+    high  = max(means, key=means.get)
+    # map back to full index
+    ser = pd.Series(raw, index=clean.index)
+    full = ser.reindex(vol.index).fillna(method='ffill').fillna(method='bfill').astype(int)
+    return full.values, high, means[high]
+
+def calibrate_regime(vol, lr, target, windows, qs, tails):
+    # rolling
+    best_wq = min(
+      ((abs((vol>rolling_quantile(vol,w,q)).mean() - target),(w,q))
+       for w,q in itertools.product(windows,qs)),
+      key=lambda x:x[0]
+    )[1]
+    # EVT
+    best_t = min(
+      ((abs((vol>garch_evt(lr,t)).mean() - target), t)
+       for t in tails),
+      key=lambda x:x[0]
+    )[1]
+    return {'window':best_wq[0],'quantile':best_wq[1],'tail':best_t}
+
+# ────────────────────────────────────────────────────────────────────────────────
+# APP LAYOUT
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="FX Threshold & Regimes", layout="wide")
+st.title("📊 FX Vol Threshold & Regime‐Shift Dashboard")
+
+# Sidebar – Data + Params
+st.sidebar.header("1️⃣ Upload Data")
+f = st.sidebar.file_uploader("CSV: Date,Open,High,Low,Close,OHLCVolatility,Currency", type="csv")
+if not f:
+    st.sidebar.info("Please upload your FX data.")
+    st.stop()
+
+df = pd.read_csv(f, parse_dates=['Date']).sort_values(['Currency','Date'])
+df['DailyVol'] = df['OHLCVolatility'] / SQRT252
+
+# Manual grouping (for later)
+mean_vol_df, band_thr_df = compute_manual_groups(df)
+
+# Cross selection
+cross_df   = df.pivot(index='Date', columns='Currency', values='DailyVol')
+# build list of crosses
+crosses = sorted([f"{b}/{q}" for i,b in enumerate(cross_df.columns)
+                  for q in cross_df.columns[i+1:]])
+sel_cross = st.sidebar.selectbox("2️⃣ Select Cross", crosses)
+
+base_cc, quote_cc = sel_cross.split('/')
+
+# HMM states
+n_states = st.sidebar.slider("3️⃣ HMM States", 2, 4, 2)
+
+# Calibration
+st.sidebar.header("4️⃣ Calibration Targets")
+target_rate  = st.sidebar.slider("Target Alert Rate", 0.01,0.20,0.05,0.01)
+roll_windows = [30,60,90,120]
+roll_qs      = [0.90,0.95,0.99]
+evt_tails    = [0.990,0.995,0.999]
+
+# Tiers & consensus
+st.sidebar.header("5️⃣ Tiers & Consensus")
+tiers     = st.sidebar.multiselect("Show Tiers", ['Warning (90%)','Alert (95%)','Critical (EVT)'],
+                                   default=['Alert (95%)'])
+cons_frac = st.sidebar.slider("Consensus Fraction", 0.1,1.0,0.5,0.05)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Compute Series for Base, Quote & Cross
+# ────────────────────────────────────────────────────────────────────────────────
+base_ser  = df[df.Currency==base_cc].set_index('Date')['DailyVol']
+quote_ser = df[df.Currency==quote_cc].set_index('Date')['DailyVol']
+common = base_ser.index.intersection(quote_ser.index)
+
+# cross vol & log returns
+cross_vol = (base_ser.loc[common]**2 + quote_ser.loc[common]**2)**0.5
+cross_lr  = np.log(
+    df[df.Currency==quote_cc].set_index('Date')['Close'].loc[common] /
+    df[df.Currency==base_cc].set_index('Date')['Close'].loc[common]
+)
+
+# regimes
+states_b,high_b,thr_b = detect_regimes(base_ser,  n_states)
+states_q,high_q,thr_q = detect_regimes(quote_ser, n_states)
+states_x,high_x,thr_x = detect_regimes(cross_vol,  n_states)
+
+# build dfs
+df_base  = pd.DataFrame({'Date':base_ser.index,  'Vol':base_ser.values,  'Regime':states_b})
+df_quote = pd.DataFrame({'Date':quote_ser.index,'Vol':quote_ser.values,'Regime':states_q})
+df_cross = pd.DataFrame({'Date':common,        'Vol':cross_vol.values,'Regime':states_x})
+
+for ddf in (df_base,df_quote,df_cross):
+    ddf['RegLabel']=ddf.Regime.map(lambda s:f"Regime {s}")
+
+chg_b = df_base.Regime.ne(df_base.Regime.shift())
+chg_q = df_quote.Regime.ne(df_quote.Regime.shift())
+chg_x = df_cross.Regime.ne(df_cross.Regime.shift())
+
+# ────────────────────────────────────────────────────────────────────────────────
+# DYNAMIC & TIER THRESHOLDS for Dashboard
+# ────────────────────────────────────────────────────────────────────────────────
+dfc = df_cross.copy().set_index('Date')
+# manual thr for cross
+mv = mean_vol_df.set_index('Currency')['MeanDailyVol']
+b1,b2 = mv[base_cc], mv[quote_cc]
+order = ['Low','Medium','High','VeryHigh']
+mb1 = mean_vol_df.set_index('Currency')['Band'][base_cc]
+mb2 = mean_vol_df.set_index('Currency')['Band'][quote_cc]
+man_band = mb1 if order.index(mb1)>order.index(mb2) else mb2
+man_thr  = band_thr_df.set_index('Band')['BandThreshold'][man_band]
+
+# per‐regime calibrate
+calib = {
+    r: calibrate_regime(
+         grp['Vol'], np.log(grp['Vol']/grp['Vol'].shift(1)).dropna(),
+         target_rate, roll_windows, roll_qs, evt_tails
+       )
+    for r,grp in df_cross.groupby('Regime')
+}
+
+# compute tier thr
+dfc['Thr_Warning'] = np.nan
+dfc['Thr_Alert']   = np.nan
+for r,grp in dfc.groupby('Regime'):
+    cp = calib[r]
+    w,q = cp['window'],cp['quantile']
+    dfc.loc[grp.index,'Thr_Warning'] = rolling_quantile(grp['Vol'], w, 0.90)
+    dfc.loc[grp.index,'Thr_Alert']   = rolling_quantile(grp['Vol'], w, q)
+dfc['Thr_Critical']= dfc.Regime.map(lambda r: garch_evt(
+    np.log(dfc['Vol']/dfc['Vol'].shift(1)).dropna().values,
+    calib[r]['tail']
+))
+
+# consensus
+cons_series = (((dfc['Vol']>dfc['Thr_Alert']).astype(int) +
+                (dfc['Vol']>dfc['Thr_Critical']).astype(int)) / 2
+              >= cons_frac)
+cons_rate   = cons_series.mean()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# TABS
+# ────────────────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📋 Overview",
+    "🔢 Threshold Dashboard",
+    f"📈 {base_cc} Regimes",
+    f"📈 {quote_cc} Regimes",
+    f"📈 {base_cc}/{quote_cc} Regimes",
+    " "  # filler
+])
+
+with tab1:
+    st.header("Why This Framework?")
+    st.markdown("""
+    - **Target Alert Rate** – align false vs. missed costs.  
+    - **HMM Regimes** – calm/normal/stress.  
+    - **Per‐Regime Calibration** of Rolling & EVT.  
+    - **Multi‐Tier Alerts** (90%,95%,EVT).  
+    - **Consensus** reduces noise.
+    """)
+
+with tab2:
+    st.header(f"🔢 Threshold Dashboard — {base_cc}/{quote_cc}")
+    # KPI cards
+    c0,c1,c2,c3,c4,c5 = st.columns(6)
+    c0.metric("Manual Thr",         f"{man_thr:.4f}")
+    c1.metric("Latest Vol",         f"{dfc['Vol'].iat[-1]:.4f}")
+    c2.metric("Warning Thr",        f"{dfc['Thr_Warning'].iat[-1]:.4f}")
+    c3.metric("Alert Thr",          f"{dfc['Thr_Alert'].iat[-1]:.4f}")
+    c4.metric("Critical Thr",       f"{dfc['Thr_Critical'].iat[-1]:.4f}")
+    c5.metric("Consensus Rate",     f"{cons_rate:.1%}")
+    st.markdown("---")
+
+    # overlay plot
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dfc.index, y=dfc['Vol'], name='Vol'))
+    if 'Warning (90%)' in tiers:
+        fig.add_trace(go.Scatter(x=dfc.index, y=dfc['Thr_Warning'],
+                                 name='Warning', line=dict(dash='dash')))
+    if 'Alert (95%)'   in tiers:
+        fig.add_trace(go.Scatter(x=dfc.index, y=dfc['Thr_Alert'],
+                                 name='Alert', line=dict(dash='dot')))
+    if 'Critical (EVT)' in tiers:
+        fig.add_trace(go.Scatter(x=dfc.index, y=dfc['Thr_Critical'],
+                                 name='Critical', line=dict(dash='longdash')))
+    fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)),
+                      height=450, yaxis_title="Daily Vol")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # breach‐rate bar
+    br = {
+        'Warning': (dfc['Vol']>dfc['Thr_Warning']).mean(),
+        'Alert':   (dfc['Vol']>dfc['Thr_Alert']).mean(),
+        'Critical':(dfc['Vol']>dfc['Thr_Critical']).mean()
+    }
+    st.bar_chart(pd.Series(br, name='Breach Rate'))
+
+with tab3:
+    st.subheader(f"{base_cc} Daily Volatility Regime Shifts")
+    fig_b = px.line(df_base, x='Date', y='Vol', color='RegLabel')
+    for d in df_base.loc[chg_b,'Date']:
+        fig_b.add_vline(x=d, line_dash='dash', line_color='red', opacity=0.6)
+    st.plotly_chart(fig_b, use_container_width=True)
+
+with tab4:
+    st.subheader(f"{quote_cc} Daily Volatility Regime Shifts")
+    fig_q = px.line(df_quote, x='Date', y='Vol', color='RegLabel')
+    for d in df_quote.loc[chg_q,'Date']:
+        fig_q.add_vline(x=d, line_dash='dash', line_color='green', opacity=0.6)
+    st.plotly_chart(fig_q, use_container_width=True)
+
+with tab5:
+    st.subheader(f"{base_cc}/{quote_cc} Cross Regime Shifts")
+    fig_x = px.line(df_cross, x='Date', y='Vol', color='RegLabel')
+    # cross changes
+    for d in df_cross.loc[chg_x,'Date']:
+        fig_x.add_vline(x=d, line_dash='dash', line_color='black', opacity=0.6)
+    # base & quote changes
+    for d in df_base.loc[chg_b & df_base.Date.isin(df_cross.Date),'Date']:
+        fig_x.add_vline(x=d, line_dash='dot', line_color='red',   opacity=0.4)
+    for d in df_quote.loc[chg_q & df_quote.Date.isin(df_cross.Date),'Date']:
+        fig_x.add_vline(x=d, line_dash='dot', line_color='green', opacity=0.4)
+    # legend traces
+    fig_x.add_trace(go.Scatter(x=[None],y=[None],mode='lines',
+        line=dict(color='red',   dash='dot'), name=f"{base_cc} Change"))
+    fig_x.add_trace(go.Scatter(x=[None],y=[None],mode='lines',
+        line=dict(color='green', dash='dot'), name=f"{quote_cc} Change"))
+    st.plotly_chart(fig_x, use_container_width=True)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Done!
+# ────────────────────────────────────────────────────────────────────────────────
