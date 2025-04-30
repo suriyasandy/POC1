@@ -1,0 +1,40 @@
+import pandas as pd
+import numpy as np
+
+def simulate_trades(df, n_trades_per_day=50, vol_col='Volatility', price_col='Close', seed=42):
+    np.random.seed(seed)
+    rows = []
+    for _, r in df.iterrows():
+        for _ in range(n_trades_per_day):
+            dev = np.random.normal(0, r[vol_col]/10)
+            rows.append({
+                'Date': r['Date'],
+                'MarketRate': r[price_col],
+                'DealRate': r[price_col]*(1+dev),
+                'Deviation': dev
+            })
+    return pd.DataFrame(rows)
+
+def apply_trade_flags(
+    trades, df_stat, df_ml, evt_threshold, manual_threshold=None
+):
+    stat_idx = df_stat.set_index('Date')['Threshold_High']
+    ml_idx   = df_ml.set_index('Date')[['IF_Anomaly','SVM_Anomaly','AE_Anomaly']]
+
+    t = trades.copy()
+    t['ThreshStat'] = t['Date'].map(stat_idx)
+    t['Rolling_Flag'] = (t['Deviation'].abs() > t['ThreshStat']).astype(int)
+    t['EVT_Flag']     = (t['Deviation'].abs() > evt_threshold).astype(int)
+    t[['IF_Flag','SVM_Flag','AE_Flag']] = t['Date'].map(ml_idx).tolist()
+
+    if manual_threshold is not None:
+        t['Manual_Flag'] = (t['Deviation'].abs() > manual_threshold).astype(int)
+
+    return t
+
+def aggregate_backtest_metrics(trades):
+    flags = [c for c in trades.columns if c.endswith('_Flag')]
+    agg = trades.groupby('Date')[flags].mean().rename(
+        columns=lambda c: c.replace('_Flag','_Rate')
+    )
+    return agg
