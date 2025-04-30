@@ -1,0 +1,94 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+
+from features import build_feature_matrix, build_synthetic_cross
+from models.statistical import (
+    rolling_quantile_thresholds, garch_evt_threshold,
+    compute_manual_thresholds, get_manual_threshold_cross
+)
+from models.ml import run_isolation_forest, run_one_class_svm, run_autoencoder
+from models.ensemble import compute_consensus
+from models.backtest import simulate_trades, apply_trade_flags, aggregate_backtest_metrics
+
+st.set_page_config(page_title="FX PoC: INRJPY Example", layout="wide")
+st.title("FX Volatility PoC — Manual vs. Dynamic (INRJPY)")
+
+# 1) Upload consolidated CSV
+uploaded = st.file_uploader("Upload consolidated FX data", type="csv")
+if not uploaded:
+    st.stop()
+
+df_all = pd.read_csv(uploaded, parse_dates=['Date'])
+df_all = build_feature_matrix(df_all)
+
+# 2) Compute manual thresholds for all USD-X
+mean_vol_df, group_thr_df = compute_manual_thresholds(df_all, 'Currency', 'OHLCVolatility')
+manual_thr = get_manual_threshold_cross(mean_vol_df, group_thr_df, 'INR','JPY')
+
+st.subheader("Manual Thresholds")
+st.dataframe(mean_vol_df)
+st.dataframe(group_thr_df)
+st.markdown(f"**Manual INR/JPY Daily Vol Threshold** = {manual_thr:.4f}")
+
+# 3) Build synthetic cross INRJPY
+df_cross = build_synthetic_cross(df_all, base='INR', quote='JPY')
+st.subheader("Sample Synthetic INRJPY Data")
+st.dataframe(df_cross.head(5))
+
+# 4) Statistical thresholds
+rq_w, (rq_l, rq_h), evt_p = (
+    st.slider("Rolling Window",30,120,60),
+    st.slider("Quantiles (low,high)",0.01,0.10,(0.05,0.95)),
+    st.slider("EVT Tail %ile",0.990,0.999,0.995,step=0.001)
+)
+df_stat = rolling_quantile_thresholds(df_cross[['Date','Volatility']].rename(
+    columns={'Volatility':'Volatility'}), window=rq_w, low_q=rq_l, high_q=rq_h)
+evt_thr = garch_evt_threshold(df_cross, tail_pct=evt_p)
+
+# 5) ML anomalies
+cont_if, nu_svm, ae_tail = (
+    st.slider("IF Contamination",0.01,0.10,0.05,step=0.005),
+    st.slider("SVM ν",0.01,0.10,0.05,step=0.005),
+    st.slider("AE Tail %ile",0.90,0.99,0.95,step=0.01)
+)
+X = df_cross[['Volatility','LogReturn']].values
+df_ml = df_cross[['Date','Volatility']].copy()
+df_ml['IF_Anomaly']  = run_isolation_forest(X, contamination=cont_if)
+df_ml['SVM_Anomaly'] = run_one_class_svm(X, nu=nu_svm)
+ae_mse              = run_autoencoder(X)
+ae_thr              = np.quantile(ae_mse, ae_tail)
+df_ml['AE_Anomaly'] = (ae_mse>ae_thr).astype(int)
+
+# 6) Consensus
+cons_t = st.slider("Consensus Threshold",0.1,1.0,0.5,step=0.05)
+df_cons = pd.DataFrame({
+    'Date':     df_stat['Date'],
+    'Volatility':df_stat['Volatility'],
+    'Rolling':  (df_stat['Volatility']>df_stat['Threshold_High']).astype(int),
+    'IF':       df_ml['IF_Anomaly'],
+    'SVM':      df_ml['SVM_Anomaly'],
+    'AE':       df_ml['AE_Anomaly']
+})
+df_cons['Score'], df_cons['Breach'] = compute_consensus(df_cons[['Rolling','IF','SVM','AE']], threshold=cons_t)
+
+# 7) Backtest comparison
+trades = simulate_trades(df_cross, n_trades_per_day=50)
+trades_flagged = apply_trade_flags(trades, df_stat, df_ml, evt_thr, manual_threshold=manual_thr)
+metrics = aggregate_backtest_metrics(trades_flagged)
+
+# — Show Comparisons —
+st.subheader("Daily Flag Rate Comparison")
+st.line_chart(metrics.rename(columns=lambda c: c.replace('_Rate','')))
+
+st.subheader("Volatility & Thresholds Over Time")
+fig = go.Figure([
+    go.Scatter(x=df_cross['Date'], y=df_cross['Volatility'], name='Vol'),
+    go.Scatter(x=df_stat['Date'], y=df_stat['Threshold_High'], name='Rolling Upper'),
+    go.Scatter(x=df_cross['Date'], y=[evt_thr]*len(df_cross), name='EVT Thr'),
+    go.Scatter(x=df_cross['Date'], y=[manual_thr]*len(df_cross), name='Manual Thr',
+               line=dict(color='black',dash='dash'))
+])
+fig.update_layout(xaxis=dict(rangeslider={'visible':True}),yaxis_title="Volatility")
+st.plotly_chart(fig, use_container_width=True)
