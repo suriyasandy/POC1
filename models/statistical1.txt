@@ -1,0 +1,92 @@
+import numpy as np
+import pandas as pd
+from arch import arch_model
+from scipy.stats import genpareto
+
+# Manual band definitions (on **daily** realized vol)
+SQRT252 = np.sqrt(252)
+ANNUAL_BOUNDS = {
+    'Low':       (0.00, 0.07),
+    'Medium':    (0.07, 0.50),
+    'High':      (0.50, 0.60),
+    'Very High': (0.60, None)
+}
+
+def rolling_quantile_thresholds(
+    df: pd.DataFrame,
+    vol_col: str = 'Volatility',
+    window: int = 60,
+    low_q: float = 0.05,
+    high_q: float = 0.95
+) -> pd.DataFrame:
+    out = df.copy()
+    out['Threshold_Low']  = out[vol_col].rolling(window).quantile(low_q)
+    out['Threshold_High'] = out[vol_col].rolling(window).quantile(high_q)
+    return out
+
+def garch_evt_threshold(
+    df: pd.DataFrame,
+    return_col: str = 'LogReturn',
+    tail_pct: float = 0.995
+) -> float:
+    rets = df[return_col].dropna().values * 100.0
+    am  = arch_model(rets, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+
+    std_resid = (res.resid / res.conditional_volatility)
+    std_resid = std_resid[~np.isnan(std_resid)]
+
+    u       = np.quantile(std_resid, 0.90)
+    exceed  = std_resid[std_resid > u] - u
+    c, loc, scale = genpareto.fit(exceed, floc=0)
+
+    p_exceed = np.mean(std_resid > u)
+    p_exc    = (tail_pct - (1 - p_exceed)) / p_exceed
+    var_exc  = genpareto.ppf(p_exc, c, loc=0, scale=scale)
+    var      = u + var_exc
+
+    # return annual vol threshold
+    return var / 100.0
+
+def compute_manual_thresholds(
+    df: pd.DataFrame,
+    currency_col: str = 'Currency',
+    vol_col: str = 'OHLCVolatility'
+) -> (pd.DataFrame, pd.DataFrame):
+    """
+    1) daily vol = annual_vol / sqrt(252)
+    2) mean daily vol per currency
+    3) assign group by ANNUAL_BOUNDS
+    4) group threshold = max(mean daily vol)
+    """
+    df2 = df.copy()
+    df2['DailyVol'] = df2[vol_col] / SQRT252
+    mean_vol = df2.groupby(currency_col)['DailyVol'] \
+                  .mean().reset_index(name='MeanDailyVol')
+
+    def assign_group(x):
+        for grp,(low,high) in ANNUAL_BOUNDS.items():
+            if high is None:
+                if x >= low: return grp
+            elif x >= low and x < high:
+                return grp
+        return None
+
+    mean_vol['Group'] = mean_vol['MeanDailyVol'].apply(assign_group)
+    group_thr = mean_vol.groupby('Group')['MeanDailyVol'] \
+                       .max().reset_index(name='ThresholdDailyVol')
+    return mean_vol, group_thr
+
+def get_manual_threshold_cross(
+    mean_vol_df: pd.DataFrame,
+    group_thr_df: pd.DataFrame,
+    curr1: str,
+    curr2: str
+) -> float:
+    grp1 = mean_vol_df.loc[mean_vol_df['Currency']==curr1,'Group'].iloc[0]
+    grp2 = mean_vol_df.loc[mean_vol_df['Currency']==curr2,'Group'].iloc[0]
+    if grp1 == grp2:
+        return group_thr_df.loc[group_thr_df['Group']==grp1,'ThresholdDailyVol'].iloc[0]
+    order = ['Low','Medium','High','Very High']
+    chosen = grp1 if order.index(grp1)>order.index(grp2) else grp2
+    return group_thr_df.loc[group_thr_df['Group']==chosen,'ThresholdDailyVol'].iloc[0]
