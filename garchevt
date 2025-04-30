@@ -1,0 +1,27 @@
+def garch_evt_thr(returns, tail_pct=0.995):
+    """
+    GARCH(1,1) + EVT tail‐risk threshold.
+    `returns` should be a 1D numpy array of log returns.
+    """
+    # 1) Fit GARCH
+    am = arch_model(returns * 100.0, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+
+    # 2) Standardized residuals
+    std_resid = res.resid / res.conditional_volatility
+    # filter out NaNs
+    std_resid = std_resid[~np.isnan(std_resid)]
+
+    # 3) EVT on the upper tail
+    u = np.quantile(std_resid, 0.90)
+    exceed = std_resid[std_resid > u] - u
+    shape, loc, scale = genpareto.fit(exceed, floc=0)
+
+    # 4) Find the percentile threshold in the fitted GPD
+    p_exceed = np.mean(std_resid > u)
+    # solve for the tail‐risk quantile
+    tail_prob = (tail_pct - (1 - p_exceed)) / p_exceed
+    var_exc = genpareto.ppf(tail_prob, shape, loc=0, scale=scale)
+
+    # 5) convert back to volatility units
+    return (u + var_exc) / 100.0
