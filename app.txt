@@ -1,0 +1,108 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+
+from features import build_feature_matrix, build_all_synthetic_crosses
+from models.statistical import (
+    rolling_quantile_thresholds, garch_evt_threshold,
+    compute_manual_thresholds, get_manual_threshold_cross
+)
+from models.ml import run_isolation_forest, run_one_class_svm, run_autoencoder
+from models.ensemble import compute_consensus
+from models.backtest import simulate_trades, apply_trade_flags, aggregate_backtest_metrics
+
+st.set_page_config(page_title="FX PoC: All Crosses", layout="wide")
+st.title("FX Volatility PoC — Manual vs. Dynamic for All Crosses")
+
+# 1) Upload consolidated CSV
+uploaded = st.file_uploader("Upload FX data (Date,Open,High,Low,Close,OHLCVolatility,Currency)", type="csv")
+if not uploaded:
+    st.stop()
+
+df_all = pd.read_csv(uploaded, parse_dates=['Date'])
+df_all = build_feature_matrix(df_all)
+
+# 2) Manual thresholds for USD-X
+mean_vol_df, group_thr_df = compute_manual_thresholds(df_all, 'Currency', 'OHLCVolatility')
+st.subheader("Manual Thresholds per Currency")
+st.dataframe(mean_vol_df)
+st.dataframe(group_thr_df)
+
+# 3) Build all synthetic crosses
+df_cross_all = build_all_synthetic_crosses(df_all)
+
+# 4) Cross selection
+crosses = sorted(df_cross_all['CrossPair'].unique())
+sel = st.multiselect("Select Cross Pair(s)", crosses, default=crosses[:2])
+if not sel:
+    st.warning("Please select at least one cross pair.")
+    st.stop()
+
+# Sidebar: common settings
+with st.sidebar:
+    st.header("Settings")
+    n_trades = st.slider("Trades/day", 10, 200, 50)
+    # Statistical
+    rq_w = st.slider("Rolling Window", 30,120,60)
+    rq_l, rq_h = st.slider("Quantiles",0.01,0.10,(0.05,0.95))
+    evt_p = st.slider("EVT tail %ile",0.990,0.999,0.995,step=0.001)
+    # ML
+    cont_if, nu_svm, ae_tail = (
+        st.slider("IF contamination",0.01,0.10,0.05,0.005),
+        st.slider("SVM ν",         0.01,0.10,0.05,0.005),
+        st.slider("AE tail %ile",  0.90, 0.99, 0.95, 0.01)
+    )
+    # Consensus
+    cons_t = st.slider("Consensus thresh",0.1,1.0,0.5,0.05)
+
+# Analyze each selected cross
+for cp in sel:
+    st.header(f"### Cross: {cp}")
+    base, quote = cp[:3], cp[3:]
+    manual_thr = get_manual_threshold_cross(mean_vol_df, group_thr_df, base, quote)
+
+    # Extract data for this cross
+    df_cross = df_cross_all[df_cross_all['CrossPair']==cp].reset_index(drop=True)
+
+    # Statistical
+    df_stat = rolling_quantile_thresholds(df_cross[['Date','Volatility']], window=rq_w, low_q=rq_l, high_q=rq_h)
+    evt_thr = garch_evt_threshold(df_cross, tail_pct=evt_p)
+
+    # ML
+    X = df_cross[['Volatility','LogReturn']].values
+    df_ml = df_cross[['Date','Volatility']].copy()
+    df_ml['IF']  = run_isolation_forest(X, contamination=cont_if)
+    df_ml['SVM'] = run_one_class_svm(X, nu=nu_svm)
+    ae_mse = run_autoencoder(X)
+    ae_thr = np.quantile(ae_mse, ae_tail)
+    df_ml['AE']  = (ae_mse > ae_thr).astype(int)
+
+    # Consensus
+    df_cons = pd.DataFrame({
+        'Date': df_stat['Date'],
+        'Volatility': df_stat['Volatility'],
+        'Rolling': (df_stat['Volatility'] > df_stat['Threshold_High']).astype(int),
+        'IF': df_ml['IF'], 'SVM': df_ml['SVM'], 'AE': df_ml['AE']
+    })
+    df_cons['Score'], df_cons['Breach'] = compute_consensus(df_cons[['Rolling','IF','SVM','AE']], threshold=cons_t)
+
+    # Backtest with manual
+    trades = simulate_trades(df_cross, n_trades_per_day=n_trades)
+    flagged = apply_trade_flags(trades, df_stat, df_ml.rename(columns={'IF':'IF_Anomaly','SVM':'SVM_Anomaly','AE':'AE_Anomaly'}),
+                                evt_thr, manual_threshold=manual_thr)
+    metrics = aggregate_backtest_metrics(flagged)
+
+    # Display comparisons
+    st.subheader("Daily Flag Rates")
+    st.line_chart(metrics.rename(columns=lambda c: c.replace('_Rate','')))
+
+    st.subheader("Volatility & Thresholds")
+    fig = go.Figure([
+        go.Scatter(x=df_cross['Date'], y=df_cross['Volatility'], name='Vol'),
+        go.Scatter(x=df_stat['Date'], y=df_stat['Threshold_High'], name='Rolling High', line={'dash':'dash'}),
+        go.Scatter(x=df_cross['Date'], y=[evt_thr]*len(df_cross), name='EVT Thr', line={'dash':'dot'}),
+        go.Scatter(x=df_cross['Date'], y=[manual_thr]*len(df_cross), name='Manual Thr', line={'dash':'longdash','color':'black'})
+    ])
+    fig.update_layout(xaxis={'rangeslider':{'visible':True}}, yaxis_title="Volatility")
+    st.plotly_chart(fig, use_container_width=True)
