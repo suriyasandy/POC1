@@ -1,0 +1,37 @@
+def detect_regimes(vol: pd.Series, n_states: int):
+    """
+    vol: daily‐volatility series indexed by Date
+    n_states: number of HMM regimes
+    returns: 
+      - full‐length numpy array of regime labels (one per vol.index)
+      - the label of the 'high‐vol' regime
+      - the mean vol of that high‐vol regime
+    """
+    # 1) drop infinities & NaNs
+    clean = vol.replace([np.inf, -np.inf], np.nan).dropna()
+    if clean.empty:
+        # fallback: everyone in regime 0
+        return np.zeros(len(vol), dtype=int), 0, np.nan
+
+    arr = clean.values.reshape(-1, 1)
+
+    # 2) fit the HMM on the cleaned data
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200)
+    model.fit(arr)
+
+    # 3) infer regimes on the cleaned slice
+    raw_states = model.predict(arr)
+
+    # 4) identify which state is 'highest‐vol'
+    means = {s: arr[raw_states == s].mean() for s in np.unique(raw_states)}
+    high = max(means, key=means.get)
+    high_mean = means[high]
+
+    # 5) build a full‐length Series of states, aligned back to vol.index
+    s = pd.Series(raw_states, index=clean.index)
+    full = s.reindex(vol.index)                \
+            .fillna(method='ffill')             \
+            .fillna(method='bfill')             \
+            .astype(int)
+
+    return full.values, high, high_mean
