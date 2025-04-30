@@ -1,0 +1,92 @@
+# ────────────────────────────────────────────────────────────────────────────────
+# AFTER your existing `with tab3:` block, insert:
+# ────────────────────────────────────────────────────────────────────────────────
+
+# 4) Threshold Dashboard (if you’d prefer it separate from tab3 above)
+tab_td = st.tabs(["🔢 Threshold Dashboard"])[0]
+with tab_td:
+    st.header("🔢 Threshold Dashboard")
+    # (Copy your KPI cards + overlay plot + breach-rate bar + consensus line here
+    #  exactly as you have inside tab3—but without redefining variables.)
+
+# 5) Currency-Level Regime Shifts
+#    Three new tabs: Base currency, Quote currency, and the Cross itself
+tab4, tab5, tab6 = st.tabs([
+    "📈 Base Regime Shifts",
+    "📈 Quote Regime Shifts",
+    "📈 Cross Regime Shifts"
+])
+
+# Split out base & quote from the selected cross
+base_cc, quote_cc = sel_cross.split('/')
+
+# Prepare per-currency daily-vol Series
+base_ser  = df[df.Currency==base_cc].set_index('Date')['DailyVol']
+quote_ser = df[df.Currency==quote_cc].set_index('Date')['DailyVol']
+
+# Detect regimes on each
+states_b, high_b, thr_b = detect_regimes(base_ser,  n_states)
+states_q, high_q, thr_q = detect_regimes(quote_ser, n_states)
+states_x, high_x, thr_x = detect_regimes(dfc['Volatility'],    n_states)
+
+# Build DataFrames for plotting
+df_base  = pd.DataFrame({'Date':base_ser.index,  'Vol':base_ser.values,  'Regime':states_b})
+df_quote = pd.DataFrame({'Date':quote_ser.index,'Vol':quote_ser.values,'Regime':states_q})
+df_cross = pd.DataFrame({'Date':dfc.Date,       'Vol':dfc.Volatility.values,'Regime':states_x})
+
+for dfccy in (df_base, df_quote, df_cross):
+    dfccy['RegLabel'] = dfccy['Regime'].map(lambda s: f"Regime {s}")
+
+# Identify regime-change dates
+chg_b = df_base.Regime.ne(df_base.Regime.shift())
+chg_q = df_quote.Regime.ne(df_quote.Regime.shift())
+chg_x = df_cross.Regime.ne(df_cross.Regime.shift())
+
+with tab4:
+    st.subheader(f"{base_cc} Regime Shifts")
+    fig_b = px.line(df_base, x='Date', y='Vol', color='RegLabel',
+                    labels={'Vol':'Daily Vol'}, title=f"{base_cc} Daily Volatility by Regime")
+    for d in df_base.loc[chg_b, 'Date']:
+        fig_b.add_vline(x=d, line_dash='dash', line_color='red', opacity=0.6)
+    st.plotly_chart(fig_b, use_container_width=True)
+
+with tab5:
+    st.subheader(f"{quote_cc} Regime Shifts")
+    fig_q = px.line(df_quote, x='Date', y='Vol', color='RegLabel',
+                    labels={'Vol':'Daily Vol'}, title=f"{quote_cc} Daily Volatility by Regime")
+    for d in df_quote.loc[chg_q, 'Date']:
+        fig_q.add_vline(x=d, line_dash='dash', line_color='green', opacity=0.6)
+    st.plotly_chart(fig_q, use_container_width=True)
+
+with tab6:
+    st.subheader(f"{base_cc}/{quote_cc} Cross Regime Shifts")
+    fig_x = px.line(df_cross, x='Date', y='Vol', color='RegLabel',
+                    labels={'Vol':'Daily Vol'}, title=f"{base_cc}/{quote_cc} Cross by Regime")
+    # cross‐level changes
+    for d in df_cross.loc[chg_x, 'Date']:
+        fig_x.add_vline(x=d, line_dash='dash', line_color='black', opacity=0.6)
+    # overlay base & quote changes (dotted)
+    for d in df_base.loc[chg_b & df_base.Date.isin(df_cross.Date), 'Date']:
+        fig_x.add_vline(x=d, line_dash='dot', line_color='red', opacity=0.4)
+    for d in df_quote.loc[chg_q & df_quote.Date.isin(df_cross.Date), 'Date']:
+        fig_x.add_vline(x=d, line_dash='dot', line_color='green', opacity=0.4)
+    # add legend entries
+    fig_x.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(color='red', dash='dot'),
+        name=f"{base_cc} Regime Change"
+    ))
+    fig_x.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(color='green', dash='dot'),
+        name=f"{quote_cc} Regime Change"
+    ))
+    st.plotly_chart(fig_x, use_container_width=True)
+
+    st.markdown("""
+    **Legend**  
+    - **Solid colors**: regime‐colored volatility (cross).  
+    - **Black dashed**: cross‐level regime changes.  
+    - **Red dotted**: base-currency regime changes.  
+    - **Green dotted**: quote-currency regime changes.
+    """)
