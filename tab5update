@@ -1,0 +1,92 @@
+with tabs[5]:
+    st.header("🚀 Shock Simulation & Recalibration")
+
+    # 1️⃣ Shock window (capped at last real date)
+    first_bd = dfc.index.min().date() + datetime.timedelta(days=1)
+    last_bd  = dfc.index.max().date()
+
+    shock_start = st.date_input(
+        "Shock Start Date",
+        value=first_bd,
+        min_value=first_bd,
+        max_value=last_bd
+    )
+    shock_end = st.date_input(
+        "Shock End Date",
+        value=last_bd,
+        min_value=shock_start,
+        max_value=last_bd
+    )
+
+    # 2️⃣ Shock magnitude & legs
+    shock_factor = st.slider("Shock Magnitude (× real vol)", 1.0, 5.0, 2.0, 0.1)
+    shock_legs   = st.multiselect("Which to shock?", ['Base Leg','Quote Leg'], default=['Quote Leg'])
+
+    # 3️⃣ Snapshot (day before start)
+    snapshot = (pd.Timestamp(shock_start) - BDay(1)).date()
+    st.markdown(f"**Snapshot Date** (pre‐shock): **{snapshot}**")
+
+    # 4️⃣ Manual threshold at snapshot
+    hist_snap   = df[df.Date <= pd.to_datetime(snapshot)]
+    mv_snap, bt = compute_manual_groups(hist_snap)
+    b1, b2      = mv_snap.set_index('Currency')['Band'][[base_cc,quote_cc]]
+    man_band    = b1 if order.index(b1)>order.index(b2) else b2
+    man_thr     = bt.set_index('Band')['BandThreshold'][man_band]
+
+    # 5️⃣ Build shocked series on exactly the common dates
+    bvol = base_ser.loc[common].copy()
+    qvol = quote_ser.loc[common].copy()
+    m    = (bvol.index.date >= shock_start) & (bvol.index.date <= shock_end)
+    if 'Base Leg'  in shock_legs: bvol.loc[m] *= shock_factor
+    if 'Quote Leg' in shock_legs: qvol.loc[m] *= shock_factor
+    shocked = np.sqrt(bvol**2 + qvol**2)
+
+    # 6️⃣ Re‐calibrate dynamic on the shocked slice
+    hist2     = shocked.loc[:pd.to_datetime(shock_end)]
+    lr2       = np.log(hist2/hist2.shift(1)).dropna().values
+    cp2       = calibrate_regime(hist2, lr2, target_rate, roll_windows, roll_qs, evt_tails)
+    dyn_alert = hist2.rolling(cp2['window']).quantile(cp2['quantile']).iat[-1]
+    dyn_evt   = evt_vol_threshold(hist2, 0.90, cp2['tail'])
+
+    # 7️⃣ KPI cards
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Manual Thr",      f"{man_thr:.4f}")
+    c2.metric("Dynamic Alert",    f"{dyn_alert:.4f}")
+    c3.metric("Dynamic EVT",      f"{dyn_evt:.4f}")
+
+    # 8️⃣ Plot **full** vs **shocked** + thresholds + shading
+    fig = go.Figure()
+    # original in grey
+    fig.add_trace(go.Scatter(
+        x=cross_vol.index, y=cross_vol.values,
+        name="Original Vol", line=dict(color='lightgrey', width=1)
+    ))
+    # shocked in blue
+    fig.add_trace(go.Scatter(
+        x=shocked.index, y=shocked.values,
+        name="Shocked Vol", line=dict(color='blue', width=2)
+    ))
+    # shaded window
+    fig.add_vrect(
+        x0=pd.to_datetime(shock_start),
+        x1=pd.to_datetime(shock_end),
+        fillcolor="LightSalmon", opacity=0.3, layer="below"
+    )
+    # thresholds
+    fig.add_hline(y=man_thr,     line_dash='dash',     line_color='black',  name="Manual Thr")
+    fig.add_hline(y=dyn_alert,   line_dash='dot',      line_color='orange', name="Dyn Alert")
+    fig.add_hline(y=dyn_evt,     line_dash='longdash', line_color='red',    name="Dyn EVT")
+
+    fig.update_layout(
+        title="Full‐Series Trend & Synthetic Shock",
+        xaxis_title="Date", yaxis_title="Daily Volatility",
+        height=450
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("""
+    - **Grey** = your real cross-volatility.  
+    - **Blue** = same series with your synthetic shock applied.  
+    - **Shaded** area = the shock window.  
+    - **Dashed** / **dot** / **longdash** lines = manual / alert / EVT thresholds.
+    """)
