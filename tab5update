@@ -1,0 +1,118 @@
+# ─ Shock Simulation ────────────────────────────────────────────────────────────
+with tabs[5]:
+    st.header("🚀 Shock Simulation & Recalibration")
+
+    # 1️⃣ Pick shock window (up to today)
+    first_bd   = dfc.index.min().date() + datetime.timedelta(days=1)
+    today_date = datetime.date.today()
+
+    shock_start = st.date_input(
+        "Shock Start Date",
+        value=first_bd,
+        min_value=first_bd,
+        max_value=today_date
+    )
+    shock_end = st.date_input(
+        "Shock End Date",
+        value=today_date,
+        min_value=shock_start,
+        max_value=today_date
+    )
+
+    # 2️⃣ Shock magnitude & legs
+    shock_factor = st.slider(
+        "Shock Magnitude (× real vol)",
+        1.0, 5.0, 2.0, 0.1
+    )
+    shock_legs = st.multiselect(
+        "Which to shock?",
+        ['Base Leg','Quote Leg'],
+        default=['Quote Leg']
+    )
+
+    # 3️⃣ Snapshot = day before shock_start
+    snapshot_pd   = pd.Timestamp(shock_start) - BDay(1)
+    snapshot_date = snapshot_pd.date()
+    st.markdown(f"**Snapshot Date** (pre‐shock): **{snapshot_date}**")
+
+    # 4️⃣ Manual Thr at snapshot
+    hist_snap      = df[df.Date <= pd.to_datetime(snapshot_date)]
+    mv_snap, bt    = compute_manual_groups(hist_snap)
+    mb1, mb2       = mv_snap.set_index('Currency')['Band'][[base_cc,quote_cc]]
+    order          = ['Low','Medium','High','VeryHigh']
+    man_band_snap  = mb1 if order.index(mb1)>order.index(mb2) else mb2
+    man_thr_snap   = bt.set_index('Band')['BandThreshold'][man_band_snap]
+
+    # 5️⃣ Build shocked legs on common dates
+    bvol_c = base_ser.loc[common].copy()
+    qvol_c = quote_ser.loc[common].copy()
+    mask   = (
+        (bvol_c.index.date >= shock_start)
+        & (bvol_c.index.date <= shock_end)
+    )
+    if 'Base Leg'  in shock_legs:
+        bvol_c.loc[mask] *= shock_factor
+    if 'Quote Leg' in shock_legs:
+        qvol_c.loc[mask] *= shock_factor
+
+    cross_shocked = np.sqrt(bvol_c**2 + qvol_c**2)
+
+    # 6️⃣ Calibrate dynamic thresholds on shocked history
+    hist2 = cross_shocked.loc[:pd.to_datetime(shock_end)]
+    lr2   = np.log(hist2/hist2.shift(1)).dropna().values
+    cp2   = calibrate_regime(
+        hist2, lr2,
+        target_rate, roll_windows, roll_qs, evt_tails
+    )
+
+    dyn_alert = hist2.rolling(cp2['window'])\
+                      .quantile(cp2['quantile']).iat[-1]
+    dyn_evt   = evt_vol_threshold(hist2, 0.90, cp2['tail'])
+
+    # 7️⃣ KPI cards
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Manual Thr (snap)",  f"{man_thr_snap:.4f}")
+    c2.metric("Dynamic Alert Thr",   f"{dyn_alert:.4f}")
+    c3.metric("Dynamic EVT Thr",     f"{dyn_evt:.4f}")
+
+    # 8️⃣ Plot full trend + shocked + thresholds + shaded window
+    fig = go.Figure()
+
+    # original series in grey
+    fig.add_trace(go.Scatter(
+        x=cross_vol.index, y=cross_vol.values,
+        name="Original Vol", line=dict(color='lightgrey', width=1)
+    ))
+
+    # shocked series in blue
+    fig.add_trace(go.Scatter(
+        x=cross_shocked.index, y=cross_shocked.values,
+        name="Shocked Vol", line=dict(color='blue', width=2)
+    ))
+
+    # shock window shading
+    fig.add_vrect(
+        x0=pd.to_datetime(shock_start),
+        x1=pd.to_datetime(shock_end),
+        fillcolor="LightSalmon", opacity=0.3, layer="below"
+    )
+
+    # thresholds
+    fig.add_hline(y=man_thr_snap,  line_dash='dash',     line_color='black',  name="Manual Thr")
+    fig.add_hline(y=dyn_alert,      line_dash='dot',      line_color='orange', name="Dyn Alert")
+    fig.add_hline(y=dyn_evt,        line_dash='longdash', line_color='red',    name="Dyn EVT")
+
+    fig.update_layout(
+        title="Full-Series Trend & Synthetic Shock",
+        xaxis_title="Date",
+        yaxis_title="Daily Volatility",
+        height=450
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("""
+    - Grey = **real** cross‐volatility.  
+    - Blue  = **shocked** series (multiplied within the shaded window).  
+    - Shaded window = your chosen shock dates.  
+    - Dashed lines = manual / dynamic thresholds for direct comparison.
+    """)
